@@ -823,6 +823,10 @@ struct kmap_ctrl {
 #endif
 };
 
+struct cache_guard_task {
+	bool				secure;
+};
+
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -935,6 +939,7 @@ struct task_struct {
 	void				*migration_pending;
 	unsigned short			migration_disabled;
 	unsigned short			migration_flags;
+	struct cache_guard_task		cache_guard;
 
 #ifdef CONFIG_PREEMPT_RCU
 	int				rcu_read_lock_nesting;

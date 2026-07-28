@@ -406,6 +406,10 @@ struct prctl_mm_map {
  */
 #define PR_GET_CFI	80
 #define PR_SET_CFI	81
+
+/* Cache side-channel mitigation prototype. */
+#define PR_SET_CACHE_SECURE	82
+#define PR_GET_CACHE_SECURE	83
 /*
  * Forward-edge CFI variants (excluding ARM64 BTI, which has its own
  * prctl()s).

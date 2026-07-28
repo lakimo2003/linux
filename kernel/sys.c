@@ -56,6 +56,7 @@
 
 #include <linux/sched.h>
 #include <linux/sched/autogroup.h>
+#include <linux/sched/cache_guard.h>
 #include <linux/sched/loadavg.h>
 #include <linux/sched/stat.h>
 #include <linux/sched/mm.h>
@@ -2906,6 +2907,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			break;
 		if (arg3 & PR_CFI_LOCK && !(arg3 & PR_CFI_DISABLE))
 			error = arch_prctl_lock_branch_landing_pad_state(me);
+		break;
+	case PR_SET_CACHE_SECURE:
+		if (arg2 != 1 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = cache_guard_mark_secure(me);
+		break;
+	case PR_GET_CACHE_SECURE:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = me->cache_guard.secure;
 		break;
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
