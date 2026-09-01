@@ -81,6 +81,8 @@
 
 #include "uid16.h"
 
+#include <asm/smp.h>
+
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
 #endif
@@ -2545,6 +2547,38 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 
 	error = 0;
 	switch (option) {
+	case PR_SET_L2_ISOLATION: {
+			int cpu;
+			const struct cpumask *l2_mask;
+
+			if (arg2 == 1) {
+					cpu = get_cpu();
+
+					l2_mask = cpu_l2c_shared_mask(cpu);
+
+					pr_info("L2 isolation enabled for PID %d on CPU %d; L2-shared CPUs: %*pbl\n",
+							current->pid,
+							cpu,
+							cpumask_pr_args(l2_mask));
+
+					put_cpu();
+
+			} else if (arg2 == 0) {
+					cpu = get_cpu();
+
+					pr_info("L2 isolation disabled for PID %d on CPU %d\n",
+							current->pid, cpu);
+
+					put_cpu();
+
+			} else {
+					error = -EINVAL;
+					break;
+			}
+
+			error = 0;
+			break;
+	}
 	case PR_SET_PDEATHSIG:
 		if (!valid_signal(arg2)) {
 			error = -EINVAL;

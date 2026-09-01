@@ -420,4 +420,6 @@ struct prctl_mm_map {
 # define PR_CFI_DISABLE		_BITUL(1)
 # define PR_CFI_LOCK		_BITUL(2)
 
+/* Custom L2 cache isolation control */
+#define PR_SET_L2_ISOLATION 0x4C320001
 #endif /* _LINUX_PRCTL_H */
