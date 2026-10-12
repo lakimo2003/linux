@@ -83,6 +83,14 @@
 
 #include <asm/smp.h>
 
+#include <linux/cpumask.h>
+#include <linux/slab.h>
+#include <linux/topology.h>
+
+#include <linux/cpumask.h>
+#include <linux/slab.h>
+#include <linux/topology.h>
+
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
 #endif
@@ -2534,6 +2542,80 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 	return 0;
 }
 
+/*
+ * Move the calling thread to a CPU with no other online SMT sibling.
+ *
+ * This changes affinity; it does not reserve the core or prevent
+ * subsequent affinity/hotplug changes.
+ */
+static long prctl_l2_isolation_enable(void)
+{
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
+	cpumask_var_t allowed;
+	int cpu, sibling;
+	int target_cpu = -1;
+	long ret;
+
+	if (!alloc_cpumask_var(&allowed, GFP_KERNEL))
+		return -ENOMEM;
+
+	/*
+	 * Keep the online/active CPU topology stable during
+	 * selection and migration.
+	 */
+	cpus_read_lock();
+
+	/* PID 0 identifies the calling thread. */
+	ret = sched_getaffinity(0, allowed);
+	if (ret)
+		goto out_unlock;
+
+	for_each_cpu_and(cpu, allowed, cpu_active_mask) {
+		const struct cpumask *siblings;
+		bool has_online_sibling = false;
+
+		siblings = topology_sibling_cpumask(cpu);
+
+		for_each_cpu_and(sibling, siblings, cpu_online_mask) {
+			if (sibling != cpu) {
+				has_online_sibling = true;
+				break;
+			}
+		}
+
+		if (!has_online_sibling) {
+			target_cpu = cpu;
+			break;
+		}
+	}
+
+	if (target_cpu < 0) {
+		ret = -ENOSPC;
+		goto out_unlock;
+	}
+
+	/*
+	 * Use the normal affinity path, including cpuset,
+	 * security and scheduling-policy checks.
+	 * It migrates the thread when necessary.
+	 */
+	ret = sched_setaffinity(0, cpumask_of(target_cpu));
+	if (ret)
+		goto out_unlock;
+
+	pr_info("PR_SET_L2_ISOLATION: task %d restricted to CPU %d; "
+		"no other online SMT sibling\n",
+		task_pid_nr(current), target_cpu);
+
+out_unlock:
+	cpus_read_unlock();
+	free_cpumask_var(allowed);
+	return ret;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
@@ -2547,38 +2629,20 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 
 	error = 0;
 	switch (option) {
-	case PR_SET_L2_ISOLATION: {
-			int cpu;
-			const struct cpumask *l2_mask;
-
-			if (arg2 == 1) {
-					cpu = get_cpu();
-
-					l2_mask = cpu_l2c_shared_mask(cpu);
-
-					pr_info("L2 isolation enabled for PID %d on CPU %d; L2-shared CPUs: %*pbl\n",
-							current->pid,
-							cpu,
-							cpumask_pr_args(l2_mask));
-
-					put_cpu();
-
-			} else if (arg2 == 0) {
-					cpu = get_cpu();
-
-					pr_info("L2 isolation disabled for PID %d on CPU %d\n",
-							current->pid, cpu);
-
-					put_cpu();
-
-			} else {
-					error = -EINVAL;
-					break;
-			}
-
-			error = 0;
+	case PR_SET_L2_ISOLATION:
+		if (arg3 || arg4 || arg5) {
+			error = -EINVAL;
 			break;
-	}
+		}
+
+		if (arg2 == 1)
+			error = prctl_l2_isolation_enable();
+		else if (arg2 == 0)
+			error = -EOPNOTSUPP; /* Affinity restoration not implemented. */
+		else
+			error = -EINVAL;
+
+		break;
 	case PR_SET_PDEATHSIG:
 		if (!valid_signal(arg2)) {
 			error = -EINVAL;
