@@ -79,6 +79,7 @@
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/sched.h>
+#include <linux/topology.h>
 
 #include <trace/events/task.h>
 
@@ -2537,34 +2538,77 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 
 static long core_reserve_enable(unsigned long cpu)
 {
-	#ifdef CONFIG_SMP
-		long ret;
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
+    long ret;
 
-		/* Reject invalid CPU numbers before using them. */
-		if (cpu >= nr_cpu_ids)
-			return -EINVAL;
+    if (current->core_reserve_enabled)
+        return -EALREADY;
 
-		/* Prevent CPU hotplug during this operation. */
-		cpus_read_lock();
+    if (cpu >= nr_cpu_ids)
+        return -EINVAL;
 
-		if (!cpu_active(cpu)) {
-			ret = -EINVAL;
-			goto out;
-		}
+    cpus_read_lock();
 
-		/*
-		* PID 0 means the calling thread.
-		* Restrict it to the selected CPU and migrate it if necessary.
-		* The normal scheduler affinity checks still apply.
-		*/
-		ret = sched_setaffinity(0, cpumask_of(cpu));
+    if (!cpu_active(cpu)) {
+        ret = -EINVAL;
+        goto out;
+    }
 
-	out:
-		cpus_read_unlock();
-		return ret;
-	#else
-		return -EOPNOTSUPP;
-	#endif
+    /* Save the original effective affinity. */
+    ret = sched_getaffinity(
+        0, &current->core_reserve_saved_mask);
+    if (ret)
+        goto out;
+
+    /* Move and pin the caller. */
+    ret = sched_setaffinity(0, cpumask_of(cpu));
+    if (ret)
+        goto out;
+
+    /* Remember the selected CPU and its whole SMT core. */
+    current->core_reserve_cpu = cpu;
+
+    cpumask_copy(
+        &current->core_reserve_siblings,
+        topology_sibling_cpumask(cpu));
+
+    current->core_reserve_enabled = true;
+
+    pr_info("core_reserve: PID %d on CPU %u; SMT CPUs: %*pbl\n",
+            task_pid_nr(current),
+            current->core_reserve_cpu,
+            cpumask_pr_args(&current->core_reserve_siblings));
+
+out:
+    cpus_read_unlock();
+    return ret;
+#else
+    return -EOPNOTSUPP;
+#endif
+}
+
+static long core_reserve_disable(void)
+{
+#ifdef CONFIG_SMP
+    long ret;
+
+    if (!current->core_reserve_enabled)
+        return -EINVAL;
+
+    cpus_read_lock();
+
+    ret = sched_setaffinity(
+        0, &current->core_reserve_saved_mask);
+
+    /* Only mark disabled if restoration succeeded. */
+    if (!ret)
+        current->core_reserve_enabled = false;
+
+    cpus_read_unlock();
+    return ret;
+#else
+    return -EOPNOTSUPP;
+#endif
 }
 
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
@@ -2581,14 +2625,24 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 	error = 0;
 	switch (option) {
 	case PR_SCHED_CORE_RESERVE:
-		if (arg2 != PR_SCHED_CORE_RESERVE_ENABLE ||
-			arg4 != 0 || arg5 != 0) {
+		if (arg4 || arg5) {
 			error = -EINVAL;
 			break;
 		}
 
-		/* arg3 contains the requested CPU number. */
-		error = core_reserve_enable(arg3);
+		switch (arg2) {
+		case PR_SCHED_CORE_RESERVE_ENABLE:
+			error = core_reserve_enable(arg3);
+			break;
+
+		case PR_SCHED_CORE_RESERVE_DISABLE:
+			error = arg3 ? -EINVAL : core_reserve_disable();
+			break;
+
+		default:
+			error = -EINVAL;
+			break;
+		}
 		break;
 	case PR_SET_PDEATHSIG:
 		if (!valid_signal(arg2)) {

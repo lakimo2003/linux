@@ -4803,6 +4803,10 @@ late_initcall(sched_core_sysctl_init);
 int sched_fork(u64 clone_flags, struct task_struct *p)
 {
 	__sched_fork(clone_flags, p);
+
+	#ifdef CONFIG_SMP
+    	p->core_reserve_enabled = false; // The child must not inherit the parent’s “enabled” state
+	#endif
 	/*
 	 * We mark the process as NEW here. This guarantees that
 	 * nobody will actually run it, and a signal or other external

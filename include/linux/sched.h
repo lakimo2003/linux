@@ -824,6 +824,12 @@ struct kmap_ctrl {
 };
 
 struct task_struct {
+#ifdef CONFIG_SMP
+    bool core_reserve_enabled; //has this thread enabled our mitigation?
+    cpumask_t core_reserve_saved_mask; // what affinity should disable restore?
+	unsigned int core_reserve_cpu; // CPU where the victim runs 
+    cpumask_t core_reserve_siblings; // all logical CPUs of that physical core, including the selected CPU
+#endif
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
 	 * For reasons of header soup (see current_thread_info()), this
