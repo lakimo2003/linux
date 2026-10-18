@@ -76,6 +76,10 @@
 #include <asm/io.h>
 #include <asm/unistd.h>
 
+#include <linux/cpu.h>
+#include <linux/cpumask.h>
+#include <linux/sched.h>
+
 #include <trace/events/task.h>
 
 #include "uid16.h"
@@ -2531,6 +2535,38 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 	return 0;
 }
 
+static long core_reserve_enable(unsigned long cpu)
+{
+	#ifdef CONFIG_SMP
+		long ret;
+
+		/* Reject invalid CPU numbers before using them. */
+		if (cpu >= nr_cpu_ids)
+			return -EINVAL;
+
+		/* Prevent CPU hotplug during this operation. */
+		cpus_read_lock();
+
+		if (!cpu_active(cpu)) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		/*
+		* PID 0 means the calling thread.
+		* Restrict it to the selected CPU and migrate it if necessary.
+		* The normal scheduler affinity checks still apply.
+		*/
+		ret = sched_setaffinity(0, cpumask_of(cpu));
+
+	out:
+		cpus_read_unlock();
+		return ret;
+	#else
+		return -EOPNOTSUPP;
+	#endif
+}
+
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
@@ -2544,6 +2580,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 
 	error = 0;
 	switch (option) {
+	case PR_SCHED_CORE_RESERVE:
+		if (arg2 != PR_SCHED_CORE_RESERVE_ENABLE ||
+			arg4 != 0 || arg5 != 0) {
+			error = -EINVAL;
+			break;
+		}
+
+		/* arg3 contains the requested CPU number. */
+		error = core_reserve_enable(arg3);
+		break;
 	case PR_SET_PDEATHSIG:
 		if (!valid_signal(arg2)) {
 			error = -EINVAL;
