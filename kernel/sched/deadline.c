@@ -650,15 +650,20 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 	struct rq *later_rq = NULL;
 	struct dl_bw *dl_b;
 
+retry_target:
 	later_rq = find_lock_later_rq(p, rq);
 	if (!later_rq) {
 		int cpu;
 
+retry:
 		/*
 		 * If we cannot preempt any rq, fall back to pick any
 		 * online CPU:
 		 */
-		cpu = cpumask_any_and(cpu_active_mask, p->cpus_ptr);
+		for_each_cpu_and(cpu, cpu_active_mask, p->cpus_ptr) {
+			if (sched_core_reserve_allowed(p, cpu))
+				break;
+		}
 		if (cpu >= nr_cpu_ids) {
 			/*
 			 * Failed to find any suitable CPU.
@@ -671,10 +676,24 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 			 * try a little harder to let the task
 			 * run.
 			 */
-			cpu = cpumask_any(cpu_active_mask);
+			for_each_cpu(cpu, cpu_active_mask) {
+				if (sched_core_reserve_allowed(p, cpu))
+					break;
+			}
 		}
 		later_rq = cpu_rq(cpu);
 		double_lock_balance(rq, later_rq);
+		if (!sched_core_reserve_allowed(p, cpu)) {
+			double_unlock_balance(rq, later_rq);
+			goto retry;
+		}
+	}
+
+	sched_core_reserve_affinity_lock();
+	if (!sched_core_reserve_allowed(p, later_rq->cpu)) {
+		sched_core_reserve_affinity_unlock();
+		double_unlock_balance(rq, later_rq);
+		goto retry_target;
 	}
 
 	if (p->dl.dl_non_contending || p->dl.dl_throttled) {
@@ -710,6 +729,7 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 	raw_spin_unlock(&dl_b->lock);
 
 	set_task_cpu(p, later_rq->cpu);
+	sched_core_reserve_affinity_unlock();
 	double_unlock_balance(later_rq, rq);
 
 	return later_rq;
@@ -2915,7 +2935,8 @@ static struct task_struct *pick_earliest_pushable_dl_task(struct rq *rq, int cpu
 	while (next_node) {
 		p = __node_2_pdl(next_node);
 
-		if (task_is_pushable(rq, p, cpu))
+		if (task_is_pushable(rq, p, cpu) &&
+		    sched_core_reserve_allowed(p, cpu))
 			return p;
 
 		next_node = rb_next(next_node);
@@ -3111,6 +3132,13 @@ static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq)
 			}
 		}
 
+		/* Reservation admission must be checked with the target locked. */
+		if (!sched_core_reserve_allowed(task, later_rq->cpu)) {
+			double_unlock_balance(rq, later_rq);
+			later_rq = NULL;
+			continue;
+		}
+
 		/*
 		 * If the rq we found has no -deadline task, or
 		 * its earliest one has a later deadline than our
@@ -3192,10 +3220,13 @@ retry:
 		goto retry;
 	}
 
-	move_queued_task_locked(rq, later_rq, next_task);
-	ret = 1;
-
-	resched_curr(later_rq);
+	sched_core_reserve_affinity_lock();
+	if (sched_core_reserve_allowed(next_task, later_rq->cpu)) {
+		move_queued_task_locked(rq, later_rq, next_task);
+		ret = 1;
+		resched_curr(later_rq);
+	}
+	sched_core_reserve_affinity_unlock();
 
 	double_unlock_balance(rq, later_rq);
 
@@ -3278,9 +3309,13 @@ static void pull_dl_task(struct rq *this_rq)
 			if (is_migration_disabled(p)) {
 				push_task = get_push_task(src_rq);
 			} else {
-				move_queued_task_locked(src_rq, this_rq, p);
-				dmin = p->dl.deadline;
-				resched = true;
+				sched_core_reserve_affinity_lock();
+				if (sched_core_reserve_allowed(p, this_cpu)) {
+					move_queued_task_locked(src_rq, this_rq, p);
+					dmin = p->dl.deadline;
+					resched = true;
+				}
+				sched_core_reserve_affinity_unlock();
 			}
 
 			/* Is there any other task even earlier? */
@@ -3291,8 +3326,13 @@ skip:
 		if (push_task) {
 			preempt_disable();
 			raw_spin_rq_unlock(this_rq);
-			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
-					    push_task, &src_rq->push_work);
+			if (!stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
+						push_task, &src_rq->push_work)) {
+				raw_spin_rq_lock(src_rq);
+				src_rq->push_busy = false;
+				raw_spin_rq_unlock(src_rq);
+				put_task_struct(push_task);
+			}
 			preempt_enable();
 			raw_spin_rq_lock(this_rq);
 		}
@@ -3634,7 +3674,7 @@ static void prio_changed_dl(struct rq *rq, struct task_struct *p, u64 old_deadli
 	}
 }
 
-#ifdef CONFIG_SCHED_CORE
+#if defined(CONFIG_SCHED_CORE) || defined(CONFIG_SCHED_CORE_RESERVATION)
 static int task_is_throttled_dl(struct task_struct *p, int cpu)
 {
 	return p->dl.dl_throttled;
@@ -3670,7 +3710,7 @@ DEFINE_SCHED_CLASS(dl) = {
 	.switched_to		= switched_to_dl,
 
 	.update_curr		= update_curr_dl,
-#ifdef CONFIG_SCHED_CORE
+#if defined(CONFIG_SCHED_CORE) || defined(CONFIG_SCHED_CORE_RESERVATION)
 	.task_is_throttled	= task_is_throttled_dl,
 #endif
 };

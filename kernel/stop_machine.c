@@ -40,6 +40,8 @@ struct cpu_stopper {
 	raw_spinlock_t		lock;
 	bool			enabled;	/* is this stopper enabled? */
 	struct list_head	works;		/* list of pending works */
+	bool			running;	/* a callback is executing */
+	bool			reserved;	/* core reservation excludes stop work */
 
 	struct cpu_stop_work	stop_work;	/* for stop_cpus */
 	unsigned long		caller;
@@ -67,6 +69,85 @@ void print_stop_info(const char *log_lvl, struct task_struct *task)
 static DEFINE_MUTEX(stop_cpus_mutex);
 static bool stop_cpus_in_progress;
 
+/*
+ * Reservation changes take stop_cpus_mutex before any stopper->lock.  Whole
+ * stop batches hold the mutex from their admission check through queueing;
+ * single and paired requests check reserved under their existing stopper
+ * locks.  Consequently a batch is either admitted in its entirety or refused
+ * before any callback can enter a multi-CPU rendezvous.
+ *
+ * The caller must stabilize CPU hotplug.  Success closes stopper admission,
+ * but does not prove that the stopper thread itself has switched out after
+ * finishing its last callback.  The scheduler reservation's subsequent
+ * context-switch rendezvous establishes that stronger condition.
+ */
+int cpu_stop_reserve(const struct cpumask *mask)
+{
+	unsigned int cpu, rollback_cpu;
+	unsigned long flags;
+	int ret = 0;
+
+	lockdep_assert_cpus_held();
+	mutex_lock(&stop_cpus_mutex);
+	for_each_cpu(cpu, mask) {
+		struct cpu_stopper *stopper = &per_cpu(cpu_stopper, cpu);
+
+		raw_spin_lock_irqsave(&stopper->lock, flags);
+		if (!stopper->enabled || stopper->reserved || stopper->running ||
+		    !list_empty(&stopper->works))
+			ret = -EBUSY;
+		else
+			stopper->reserved = true;
+		raw_spin_unlock_irqrestore(&stopper->lock, flags);
+		if (ret)
+			goto rollback;
+	}
+	goto unlock;
+
+rollback:
+	for_each_cpu(rollback_cpu, mask) {
+		struct cpu_stopper *stopper;
+
+		if (rollback_cpu == cpu)
+			break;
+		stopper = &per_cpu(cpu_stopper, rollback_cpu);
+		raw_spin_lock_irqsave(&stopper->lock, flags);
+		stopper->reserved = false;
+		raw_spin_unlock_irqrestore(&stopper->lock, flags);
+	}
+unlock:
+	mutex_unlock(&stop_cpus_mutex);
+	return ret;
+}
+
+void cpu_stop_unreserve(const struct cpumask *mask)
+{
+	unsigned int cpu;
+	unsigned long flags;
+
+	mutex_lock(&stop_cpus_mutex);
+	for_each_cpu(cpu, mask) {
+		struct cpu_stopper *stopper = &per_cpu(cpu_stopper, cpu);
+
+		raw_spin_lock_irqsave(&stopper->lock, flags);
+		stopper->reserved = false;
+		raw_spin_unlock_irqrestore(&stopper->lock, flags);
+	}
+	mutex_unlock(&stop_cpus_mutex);
+}
+
+static bool cpu_stop_mask_reserved(const struct cpumask *mask)
+{
+	unsigned int cpu;
+
+	lockdep_assert_held(&stop_cpus_mutex);
+	for_each_cpu(cpu, mask) {
+		if (per_cpu(cpu_stopper.reserved, cpu))
+			return true;
+	}
+	return false;
+}
+
 static void cpu_stop_init_done(struct cpu_stop_done *done, unsigned int nr_todo)
 {
 	memset(done, 0, sizeof(*done));
@@ -87,27 +168,28 @@ static void __cpu_stop_queue_work(struct cpu_stopper *stopper,
 	list_add_tail(&work->list, &stopper->works);
 }
 
-/* queue @work to @stopper.  if offline, @work is completed immediately */
-static bool cpu_stop_queue_work(unsigned int cpu, struct cpu_stop_work *work)
+/* Refused work is completed immediately; its callback will not execute. */
+static int cpu_stop_queue_work(unsigned int cpu, struct cpu_stop_work *work)
 {
 	struct cpu_stopper *stopper = &per_cpu(cpu_stopper, cpu);
 	unsigned long flags;
-	bool enabled;
+	int ret;
 
 	preempt_disable();
 	raw_spin_lock_irqsave(&stopper->lock, flags);
-	enabled = stopper->enabled;
-	if (enabled)
+	ret = stopper->reserved ? -EBUSY :
+	      !stopper->enabled ? -ENOENT : 0;
+	if (!ret)
 		__cpu_stop_queue_work(stopper, work);
 	else if (work->done)
 		cpu_stop_signal_done(work->done);
 	raw_spin_unlock_irqrestore(&stopper->lock, flags);
 
-	if (enabled)
+	if (!ret)
 		wake_up_process(stopper->thread);
 	preempt_enable();
 
-	return enabled;
+	return ret;
 }
 
 /**
@@ -132,16 +214,19 @@ static bool cpu_stop_queue_work(unsigned int cpu, struct cpu_stop_work *work)
  *
  * RETURNS:
  * -ENOENT if @fn(@arg) was not executed because @cpu was offline;
+ * -EBUSY if a core reservation excludes stopper execution on @cpu;
  * otherwise, the return value of @fn.
  */
 int stop_one_cpu(unsigned int cpu, cpu_stop_fn_t fn, void *arg)
 {
 	struct cpu_stop_done done;
 	struct cpu_stop_work work = { .fn = fn, .arg = arg, .done = &done, .caller = _RET_IP_ };
+	int ret;
 
 	cpu_stop_init_done(&done, 1);
-	if (!cpu_stop_queue_work(cpu, &work))
-		return -ENOENT;
+	ret = cpu_stop_queue_work(cpu, &work);
+	if (ret)
+		return ret;
 	/*
 	 * In case @cpu == smp_proccessor_id() we can avoid a sleep+wakeup
 	 * cycle by doing a preemption:
@@ -276,6 +361,11 @@ retry:
 	raw_spin_lock_irq(&stopper1->lock);
 	raw_spin_lock_nested(&stopper2->lock, SINGLE_DEPTH_NESTING);
 
+	if (stopper1->reserved || stopper2->reserved) {
+		err = -EBUSY;
+		goto unlock;
+	}
+
 	if (!stopper1->enabled || !stopper2->enabled) {
 		err = -ENOENT;
 		goto unlock;
@@ -330,13 +420,15 @@ unlock:
  *
  * Stops both the current and specified CPU and runs @fn on one of them.
  *
- * returns when both are completed.
+ * Returns when both are completed, or -EBUSY without queueing either
+ * callback if a core reservation excludes either CPU.
  */
 int stop_two_cpus(unsigned int cpu1, unsigned int cpu2, cpu_stop_fn_t fn, void *arg)
 {
 	struct cpu_stop_done done;
 	struct cpu_stop_work work1, work2;
 	struct multi_stop_data msdata;
+	int ret;
 
 	msdata = (struct multi_stop_data){
 		.fn = fn,
@@ -357,8 +449,9 @@ int stop_two_cpus(unsigned int cpu1, unsigned int cpu2, cpu_stop_fn_t fn, void *
 
 	if (cpu1 > cpu2)
 		swap(cpu1, cpu2);
-	if (cpu_stop_queue_two_works(cpu1, &work1, cpu2, &work2))
-		return -ENOENT;
+	ret = cpu_stop_queue_two_works(cpu1, &work1, cpu2, &work2);
+	if (ret)
+		return ret;
 
 	wait_for_completion(&done.completion);
 	return done.ret;
@@ -386,16 +479,20 @@ bool stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
 			struct cpu_stop_work *work_buf)
 {
 	*work_buf = (struct cpu_stop_work){ .fn = fn, .arg = arg, .caller = _RET_IP_, };
-	return cpu_stop_queue_work(cpu, work_buf);
+	return !cpu_stop_queue_work(cpu, work_buf);
 }
 
-static bool queue_stop_cpus_work(const struct cpumask *cpumask,
+static int queue_stop_cpus_work(const struct cpumask *cpumask,
 				 cpu_stop_fn_t fn, void *arg,
 				 struct cpu_stop_done *done)
 {
 	struct cpu_stop_work *work;
 	unsigned int cpu;
 	bool queued = false;
+
+	/* Refuse the complete rendezvous, never just one participant. */
+	if (cpu_stop_mask_reserved(cpumask))
+		return -EBUSY;
 
 	/*
 	 * Disable preemption while queueing to avoid getting
@@ -411,24 +508,26 @@ static bool queue_stop_cpus_work(const struct cpumask *cpumask,
 		work->arg = arg;
 		work->done = done;
 		work->caller = _RET_IP_;
-		if (cpu_stop_queue_work(cpu, work))
+		if (!cpu_stop_queue_work(cpu, work))
 			queued = true;
 	}
 	barrier();
 	stop_cpus_in_progress = false;
 	preempt_enable();
 
-	return queued;
+	return queued ? 0 : -ENOENT;
 }
 
 static int __stop_cpus(const struct cpumask *cpumask,
 		       cpu_stop_fn_t fn, void *arg)
 {
 	struct cpu_stop_done done;
+	int ret;
 
 	cpu_stop_init_done(&done, cpumask_weight(cpumask));
-	if (!queue_stop_cpus_work(cpumask, fn, arg, &done))
-		return -ENOENT;
+	ret = queue_stop_cpus_work(cpumask, fn, arg, &done);
+	if (ret)
+		return ret;
 	wait_for_completion(&done.completion);
 	return done.ret;
 }
@@ -458,7 +557,8 @@ static int __stop_cpus(const struct cpumask *cpumask,
  *
  * RETURNS:
  * -ENOENT if @fn(@arg) was not executed at all because all cpus in
- * @cpumask were offline; otherwise, 0 if all executions of @fn
+ * @cpumask were offline; -EBUSY without queueing any callback if a core
+ * reservation excludes a CPU in @cpumask; otherwise, 0 if all executions of @fn
  * returned 0, any non zero return value if any returned non zero.
  */
 static int stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg)
@@ -496,6 +596,7 @@ repeat:
 		work = list_first_entry(&stopper->works,
 					struct cpu_stop_work, list);
 		list_del_init(&work->list);
+		stopper->running = true;
 	}
 	raw_spin_unlock_irq(&stopper->lock);
 
@@ -520,6 +621,9 @@ repeat:
 		stopper->caller = 0;
 		WARN_ONCE(preempt_count(),
 			  "cpu_stop: %ps(%p) leaked preempt count\n", fn, arg);
+		raw_spin_lock_irq(&stopper->lock);
+		stopper->running = false;
+		raw_spin_unlock_irq(&stopper->lock);
 		goto repeat;
 	}
 }
@@ -699,8 +803,12 @@ int stop_machine_from_inactive_cpu(cpu_stop_fn_t fn, void *data,
 	/* Schedule work on other CPUs and execute directly for local CPU */
 	set_state(&msdata, MULTI_STOP_PREPARE);
 	cpu_stop_init_done(&done, num_active_cpus());
-	queue_stop_cpus_work(cpu_active_mask, multi_cpu_stop, &msdata,
-			     &done);
+	ret = queue_stop_cpus_work(cpu_active_mask, multi_cpu_stop, &msdata,
+				   &done);
+	if (ret == -EBUSY) {
+		mutex_unlock(&stop_cpus_mutex);
+		return ret;
+	}
 	ret = multi_cpu_stop(&msdata);
 
 	/* Busy wait for completion. */

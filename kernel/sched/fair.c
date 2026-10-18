@@ -2895,7 +2895,7 @@ static void update_numa_stats(struct task_numa_env *env,
 
 		if (find_idle && idle_core < 0 && !rq->nr_running && idle_cpu(cpu)) {
 			if (READ_ONCE(rq->numa_migrate_on) ||
-			    !cpumask_test_cpu(cpu, env->p->cpus_ptr))
+			    !task_allowed_on_cpu(env->p, cpu))
 				continue;
 
 			if (ns->idle_cpu == -1)
@@ -2927,7 +2927,7 @@ static void task_numa_assign(struct task_numa_env *env,
 		/* Find alternative idle CPU. */
 		for_each_cpu_wrap(cpu, cpumask_of_node(env->dst_nid), start + 1) {
 			if (cpu == env->best_cpu || !idle_cpu(cpu) ||
-			    !cpumask_test_cpu(cpu, env->p->cpus_ptr)) {
+			    !task_allowed_on_cpu(env->p, cpu)) {
 				continue;
 			}
 
@@ -3015,7 +3015,8 @@ static bool task_numa_compare(struct task_numa_env *env,
 	long load;
 	bool stopsearch = false;
 
-	if (READ_ONCE(dst_rq->numa_migrate_on))
+	if (READ_ONCE(dst_rq->numa_migrate_on) ||
+	    !sched_core_reserve_allowed(env->p, env->dst_cpu))
 		return false;
 
 	rcu_read_lock();
@@ -3041,7 +3042,7 @@ static bool task_numa_compare(struct task_numa_env *env,
 	}
 
 	/* Skip this swap candidate if cannot move to the source cpu. */
-	if (!cpumask_test_cpu(env->src_cpu, cur->cpus_ptr))
+	if (!task_allowed_on_cpu(cur, env->src_cpu))
 		goto unlock;
 
 	/*
@@ -3240,6 +3241,8 @@ static void task_numa_find_cpu(struct task_numa_env *env,
 
 	/* Skip CPUs if the source task cannot migrate */
 	for_each_cpu_and(cpu, cpumask_of_node(env->dst_nid), env->p->cpus_ptr) {
+		if (!sched_core_reserve_allowed(env->p, cpu))
+			continue;
 		env->dst_cpu = cpu;
 		if (task_numa_compare(env, taskimp, groupimp, maymove))
 			break;
@@ -8315,6 +8318,9 @@ sched_balance_find_dst_group_cpu(struct sched_group *group, struct task_struct *
 	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
 		struct rq *rq = cpu_rq(i);
 
+		if (!sched_core_reserve_allowed(p, i))
+			continue;
+
 		if (!sched_core_cookie_match(rq, p))
 			continue;
 
@@ -8512,6 +8518,8 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
 	for_each_cpu_and(cpu, cpu_smt_mask(target), p->cpus_ptr) {
 		if (cpu == target)
 			continue;
+		if (!sched_core_reserve_allowed(p, cpu))
+			continue;
 		/*
 		 * Check if the CPU is in the LLC scheduling domain of @target.
 		 * Due to isolcpus, there is no guarantee that all the siblings are in the domain.
@@ -8553,6 +8561,10 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 
 	if (!cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr))
 		return -1;
+	for_each_cpu(cpu, cpus) {
+		if (!sched_core_reserve_allowed(p, cpu))
+			cpumask_clear_cpu(cpu, cpus);
+	}
 
 	if (static_branch_unlikely(&sched_cluster_active)) {
 		struct sched_group *sg = sd->groups;
@@ -8669,6 +8681,10 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 
 	cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+	for_each_cpu(cpu, cpus) {
+		if (!sched_core_reserve_allowed(p, cpu))
+			cpumask_clear_cpu(cpu, cpus);
+	}
 
 	task_util = task_util_est(p);
 	util_min = uclamp_eff_value(p, UCLAMP_MIN);
@@ -8861,7 +8877,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	    recent_used_cpu != target &&
 	    cpus_share_cache(recent_used_cpu, target) &&
 	    choose_idle_cpu(recent_used_cpu, p) &&
-	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
+	    task_allowed_on_cpu(p, recent_used_cpu) &&
 	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
 
 		if (!static_branch_unlikely(&sched_cluster_active) ||
@@ -9416,7 +9432,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 			if (!cpumask_test_cpu(cpu, sched_domain_span(sd)))
 				continue;
 
-			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+			if (!task_allowed_on_cpu(p, cpu))
 				continue;
 
 			util = cpu_util(cpu, p, cpu, 0);
@@ -9559,7 +9575,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		record_wakee(p);
 
 		if ((wake_flags & WF_CURRENT_CPU) &&
-		    cpumask_test_cpu(cpu, p->cpus_ptr))
+		    task_allowed_on_cpu(p, cpu))
 			return cpu;
 
 		if (!is_rd_overutilized(this_rq()->rd)) {
@@ -9569,7 +9585,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 			new_cpu = prev_cpu;
 		}
 
-		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+		want_affine = !wake_wide(p) && task_allowed_on_cpu(p, cpu);
 	}
 
 	for_each_domain(cpu, tmp) {
@@ -10747,7 +10763,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	if (task_is_blocked(p))
 		return 0;
 
-	if (!cpumask_test_cpu(env->dst_cpu, p->cpus_ptr)) {
+	if (!task_allowed_on_cpu(p, env->dst_cpu)) {
 		int cpu;
 
 		schedstat_inc(p->stats.nr_failed_migrations_affine);
@@ -10769,7 +10785,10 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 			return 0;
 
 		/* Prevent to re-select dst_cpu via env's CPUs: */
-		cpu = cpumask_first_and_and(env->dst_grpmask, env->cpus, p->cpus_ptr);
+		for_each_cpu_and(cpu, env->dst_grpmask, env->cpus) {
+			if (task_allowed_on_cpu(p, cpu))
+				break;
+		}
 
 		if (cpu < nr_cpu_ids) {
 			env->flags |= LBF_DST_PINNED;
@@ -11029,6 +11048,61 @@ next:
 	return detached;
 }
 
+#ifdef CONFIG_SCHED_CORE_RESERVATION
+/*
+ * A reservation can be published between detach_task() and attachment.  The
+ * task remains TASK_ON_RQ_MIGRATING, so concurrent affinity changes wait for
+ * us and its mask is stable.  Recheck admission with the destination locked;
+ * hold its previous rq lock too if set_task_cpu() must retarget it.
+ */
+static void attach_migrating_task(struct task_struct *p)
+{
+	struct rq *old_rq = task_rq(p), *rq;
+	int cpu = task_cpu(p);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	for (;;) {
+		rq = cpu_rq(cpu);
+		double_rq_lock(old_rq, rq);
+		sched_core_reserve_affinity_lock();
+		if (cpu_active(cpu) && task_allowed_on_cpu(p, cpu)) {
+			update_rq_clock(old_rq);
+			if (rq != old_rq)
+				update_rq_clock(rq);
+			if (cpu != task_cpu(p))
+				set_task_cpu(p, cpu);
+			attach_task(rq, p);
+			sched_core_reserve_affinity_unlock();
+			double_rq_unlock(old_rq, rq);
+			break;
+		}
+		sched_core_reserve_affinity_unlock();
+		double_rq_unlock(old_rq, rq);
+
+		for_each_cpu_and(cpu, cpu_active_mask, p->cpus_ptr) {
+			if (task_allowed_on_cpu(p, cpu))
+				break;
+		}
+		/*
+		 * Claim, affinity and hotplug validation preserve a legal CPU.
+		 * If that invariant is broken, keep the task queued; the final
+		 * reservation execution gate still prevents unauthorized runs.
+		 */
+		if (WARN_ON_ONCE(cpu >= nr_cpu_ids)) {
+			attach_one_task(old_rq, p);
+			break;
+		}
+	}
+	local_irq_restore(flags);
+}
+#else
+static inline void attach_migrating_task(struct task_struct *p)
+{
+	attach_one_task(task_rq(p), p);
+}
+#endif
+
 /*
  * attach_tasks() -- attaches all tasks detached by detach_tasks() to their
  * new rq.
@@ -11038,6 +11112,15 @@ static void attach_tasks(struct lb_env *env)
 	struct list_head *tasks = &env->tasks;
 	struct task_struct *p;
 	struct rq_flags rf;
+
+	if (IS_ENABLED(CONFIG_SCHED_CORE_RESERVATION)) {
+		while (!list_empty(tasks)) {
+			p = list_first_entry(tasks, struct task_struct, se.group_node);
+			list_del_init(&p->se.group_node);
+			attach_migrating_task(p);
+		}
+		return;
+	}
 
 	rq_lock(env->dst_rq, &rf);
 	update_rq_clock(env->dst_rq);
@@ -13469,7 +13552,7 @@ more_balance:
 			 * if the curr task on busiest CPU can't be
 			 * moved to this_cpu:
 			 */
-			if (!cpumask_test_cpu(this_cpu, busiest->curr->cpus_ptr)) {
+			if (!task_allowed_on_cpu(busiest->curr, this_cpu)) {
 				raw_spin_rq_unlock_irqrestore(busiest, flags);
 				goto out_one_pinned;
 			}
@@ -13491,9 +13574,13 @@ more_balance:
 			preempt_disable();
 			raw_spin_rq_unlock_irqrestore(busiest, flags);
 			if (active_balance) {
-				stop_one_cpu_nowait(cpu_of(busiest),
+				if (!stop_one_cpu_nowait(cpu_of(busiest),
 					active_load_balance_cpu_stop, busiest,
-					&busiest->active_balance_work);
+					&busiest->active_balance_work)) {
+					raw_spin_rq_lock_irqsave(busiest, flags);
+					busiest->active_balance = 0;
+					raw_spin_rq_unlock_irqrestore(busiest, flags);
+				}
 			}
 			preempt_enable();
 		}
@@ -13674,7 +13761,7 @@ out_unlock:
 	rq_unlock(busiest_rq, &rf);
 
 	if (p)
-		attach_one_task(target_rq, p);
+		attach_migrating_task(p);
 
 	local_irq_enable();
 
@@ -14825,6 +14912,11 @@ bool cfs_prio_less(const struct task_struct *a, const struct task_struct *b,
 	return delta > 0;
 }
 
+#else /* !CONFIG_SCHED_CORE: */
+static inline void task_tick_core(struct rq *rq, struct task_struct *curr) {}
+#endif /* !CONFIG_SCHED_CORE */
+
+#if defined(CONFIG_SCHED_CORE) || defined(CONFIG_SCHED_CORE_RESERVATION)
 static int task_is_throttled_fair(struct task_struct *p, int cpu)
 {
 	struct cfs_rq *cfs_rq;
@@ -14836,9 +14928,7 @@ static int task_is_throttled_fair(struct task_struct *p, int cpu)
 #endif
 	return throttled_hierarchy(cfs_rq);
 }
-#else /* !CONFIG_SCHED_CORE: */
-static inline void task_tick_core(struct rq *rq, struct task_struct *curr) {}
-#endif /* !CONFIG_SCHED_CORE */
+#endif /* CONFIG_SCHED_CORE || CONFIG_SCHED_CORE_RESERVATION */
 
 /*
  * scheduler tick hitting a task of our scheduling class.
@@ -15390,7 +15480,7 @@ DEFINE_SCHED_CLASS(fair) = {
 	.task_change_group	= task_change_group_fair,
 #endif
 
-#ifdef CONFIG_SCHED_CORE
+#if defined(CONFIG_SCHED_CORE) || defined(CONFIG_SCHED_CORE_RESERVATION)
 	.task_is_throttled	= task_is_throttled_fair,
 #endif
 

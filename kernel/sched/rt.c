@@ -1762,7 +1762,8 @@ static struct task_struct *pick_highest_pushable_task(struct rq *rq, int cpu)
 		return NULL;
 
 	plist_for_each_entry(p, head, pushable_tasks) {
-		if (task_is_pushable(rq, p, cpu))
+		if (task_is_pushable(rq, p, cpu) &&
+		    sched_core_reserve_allowed(p, cpu))
 			return p;
 	}
 
@@ -1939,6 +1940,13 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 			}
 		}
 
+		/* Reservation admission must be checked with the target locked. */
+		if (!sched_core_reserve_allowed(task, lowest_rq->cpu)) {
+			double_unlock_balance(rq, lowest_rq);
+			lowest_rq = NULL;
+			continue;
+		}
+
 		/* If this rq is still suitable use it. */
 		if (lowest_rq->rt.highest_prio.curr > task->prio)
 			break;
@@ -2013,8 +2021,13 @@ retry:
 		if (push_task) {
 			preempt_disable();
 			raw_spin_rq_unlock(rq);
-			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
-					    push_task, &rq->push_work);
+			if (!stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
+						push_task, &rq->push_work)) {
+				raw_spin_rq_lock(rq);
+				rq->push_busy = false;
+				raw_spin_rq_unlock(rq);
+				put_task_struct(push_task);
+			}
 			preempt_enable();
 			raw_spin_rq_lock(rq);
 		}
@@ -2063,9 +2076,13 @@ retry:
 		goto retry;
 	}
 
-	move_queued_task_locked(rq, lowest_rq, next_task);
-	resched_curr(lowest_rq);
-	ret = 1;
+	sched_core_reserve_affinity_lock();
+	if (sched_core_reserve_allowed(next_task, lowest_rq->cpu)) {
+		move_queued_task_locked(rq, lowest_rq, next_task);
+		resched_curr(lowest_rq);
+		ret = 1;
+	}
+	sched_core_reserve_affinity_unlock();
 
 	double_unlock_balance(rq, lowest_rq);
 out:
@@ -2339,8 +2356,12 @@ static void pull_rt_task(struct rq *this_rq)
 			if (is_migration_disabled(p)) {
 				push_task = get_push_task(src_rq);
 			} else {
-				move_queued_task_locked(src_rq, this_rq, p);
-				resched = true;
+				sched_core_reserve_affinity_lock();
+				if (sched_core_reserve_allowed(p, this_cpu)) {
+					move_queued_task_locked(src_rq, this_rq, p);
+					resched = true;
+				}
+				sched_core_reserve_affinity_unlock();
 			}
 			/*
 			 * We continue with the search, just in
@@ -2355,8 +2376,13 @@ skip:
 		if (push_task) {
 			preempt_disable();
 			raw_spin_rq_unlock(this_rq);
-			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
-					    push_task, &src_rq->push_work);
+			if (!stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
+						push_task, &src_rq->push_work)) {
+				raw_spin_rq_lock(src_rq);
+				src_rq->push_busy = false;
+				raw_spin_rq_unlock(src_rq);
+				put_task_struct(push_task);
+			}
 			preempt_enable();
 			raw_spin_rq_lock(this_rq);
 		}
@@ -2582,7 +2608,7 @@ static unsigned int get_rr_interval_rt(struct rq *rq, struct task_struct *task)
 		return 0;
 }
 
-#ifdef CONFIG_SCHED_CORE
+#if defined(CONFIG_SCHED_CORE) || defined(CONFIG_SCHED_CORE_RESERVATION)
 static int task_is_throttled_rt(struct task_struct *p, int cpu)
 {
 	struct rt_rq *rt_rq;
@@ -2596,7 +2622,7 @@ static int task_is_throttled_rt(struct task_struct *p, int cpu)
 
 	return rt_rq_throttled(rt_rq);
 }
-#endif /* CONFIG_SCHED_CORE */
+#endif /* CONFIG_SCHED_CORE || CONFIG_SCHED_CORE_RESERVATION */
 
 DEFINE_SCHED_CLASS(rt) = {
 	.enqueue_task		= enqueue_task_rt,
@@ -2627,7 +2653,7 @@ DEFINE_SCHED_CLASS(rt) = {
 
 	.update_curr		= update_curr_rt,
 
-#ifdef CONFIG_SCHED_CORE
+#if defined(CONFIG_SCHED_CORE) || defined(CONFIG_SCHED_CORE_RESERVATION)
 	.task_is_throttled	= task_is_throttled_rt,
 #endif
 

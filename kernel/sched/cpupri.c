@@ -69,7 +69,7 @@ static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 				struct cpumask *lowest_mask, int idx)
 {
 	struct cpupri_vec *vec  = &cp->pri_to_cpu[idx];
-	int skip = 0;
+	int skip = 0, cpu;
 
 	if (!atomic_read(&(vec)->count))
 		skip = 1;
@@ -103,6 +103,10 @@ static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 	if (lowest_mask) {
 		cpumask_and(lowest_mask, &p->cpus_mask, vec->mask);
 		cpumask_and(lowest_mask, lowest_mask, cpu_active_mask);
+		for_each_cpu(cpu, lowest_mask) {
+			if (!sched_core_reserve_allowed(p, cpu))
+				cpumask_clear_cpu(cpu, lowest_mask);
+		}
 
 		/*
 		 * We have to ensure that we have at least one bit
@@ -114,6 +118,12 @@ static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 		 */
 		if (cpumask_empty(lowest_mask))
 			return 0;
+	} else {
+		for_each_cpu_and(cpu, &p->cpus_mask, vec->mask) {
+			if (sched_core_reserve_allowed(p, cpu))
+				return 1;
+		}
+		return 0;
 	}
 
 	return 1;
