@@ -79,6 +79,7 @@
 
 #include "exit.h"
 
+#include <linux/core_reserve.h>
 /*
  * The default value should be high enough to not crash a system that randomly
  * crashes its kernel from time to time, but low enough to at least not permit
@@ -949,6 +950,8 @@ void __noreturn do_exit(long code)
 	io_uring_files_cancel();
 	sched_mm_cid_exit(tsk);
 	exit_signals(tsk);  /* sets PF_EXITING */
+
+	core_reserve_exit();
 
 	seccomp_filter_release(tsk);
 

@@ -80,6 +80,8 @@
 #include <linux/cpumask.h>
 #include <linux/sched.h>
 #include <linux/topology.h>
+#include <linux/mutex.h>
+#include <linux/core_reserve.h>
 
 #include <trace/events/task.h>
 
@@ -2536,6 +2538,69 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 	return 0;
 }
 
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
+
+/* Both SMT siblings point to the same owning thread. */
+static struct task_struct *core_owner[NR_CPUS];
+
+/* Protects every access to core_owner[]. */
+static DEFINE_MUTEX(core_owner_mutex);
+
+static int claim_desired_core(unsigned int cpu)
+{
+    int sibling;
+    int ret = 0;
+
+    /*
+     * The enable helper already holds cpus_read_lock(),
+     * so topology cannot change during this operation.
+     */
+    cpumask_copy(&current->core_reserve_siblings,
+                 topology_sibling_cpumask(cpu));
+
+    mutex_lock(&core_owner_mutex);
+
+    /* First check the entire core, without changing anything. */
+    for_each_cpu(sibling, &current->core_reserve_siblings) {
+        if (core_owner[sibling]) {
+            ret = -EBUSY;
+            goto out;
+        }
+    }
+
+    /* Claim every logical CPU belonging to this core. */
+    for_each_cpu(sibling, &current->core_reserve_siblings)
+        core_owner[sibling] = current;
+
+out:
+    mutex_unlock(&core_owner_mutex);
+    return ret;
+}
+
+static void core_reserve_release_claim(void)
+{
+    int sibling;
+
+    mutex_lock(&core_owner_mutex);
+
+    for_each_cpu(sibling, &current->core_reserve_siblings) {
+        if (core_owner[sibling] == current)
+            core_owner[sibling] = NULL;
+    }
+
+    current->core_reserve_enabled = false;
+
+    mutex_unlock(&core_owner_mutex);
+}
+
+void core_reserve_exit(void)
+{
+    if (current->core_reserve_enabled)
+        core_reserve_release_claim();
+}
+
+#endif
+
 static long core_reserve_enable(unsigned long cpu)
 {
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
@@ -2560,19 +2625,21 @@ static long core_reserve_enable(unsigned long cpu)
     if (ret)
         goto out;
 
-    /* Move and pin the caller. */
-    ret = sched_setaffinity(0, cpumask_of(cpu));
-    if (ret)
-        goto out;
+	/* Claim the destination core. */
+	ret = claim_desired_core(cpu);
+	if (ret)
+		goto out;
 
-    /* Remember the selected CPU and its whole SMT core. */
-    current->core_reserve_cpu = cpu;
+	/* Move the owner to the requested logical CPU. */
+	ret = sched_setaffinity(0, cpumask_of(cpu));
+	if (ret) {
+		/* Migration failed: do not leave a claim behind. */
+		core_reserve_release_claim();
+		goto out;
+	}
 
-    cpumask_copy(
-        &current->core_reserve_siblings,
-        topology_sibling_cpumask(cpu));
-
-    current->core_reserve_enabled = true;
+	current->core_reserve_cpu = cpu;
+	current->core_reserve_enabled = true;
 
     pr_info("core_reserve: PID %d on CPU %u; SMT CPUs: %*pbl\n",
             task_pid_nr(current),
@@ -2589,7 +2656,7 @@ out:
 
 static long core_reserve_disable(void)
 {
-#ifdef CONFIG_SMP
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
     long ret;
 
     if (!current->core_reserve_enabled)
@@ -2600,9 +2667,8 @@ static long core_reserve_disable(void)
     ret = sched_setaffinity(
         0, &current->core_reserve_saved_mask);
 
-    /* Only mark disabled if restoration succeeded. */
     if (!ret)
-        current->core_reserve_enabled = false;
+        core_reserve_release_claim();
 
     cpus_read_unlock();
     return ret;
