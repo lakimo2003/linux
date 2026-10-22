@@ -2565,6 +2565,33 @@ bool is_core_claimed_already(unsigned int cpu)
     return claimed;
 }
 
+bool core_reserve_task_allowed(struct task_struct *p,
+                               unsigned int cpu)
+{
+    struct task_struct *owner;
+    unsigned long flags;
+    bool allowed;
+
+    if (cpu >= nr_cpu_ids)
+        return false;
+
+    raw_spin_lock_irqsave(&core_owner_lock, flags);
+
+    owner = core_owner[cpu];
+
+    if (!owner) {
+        // No reservations on this CPU
+        allowed = true;
+    } else {
+        // The only thread allowed to run on this CPU is the owner thread itself
+        allowed = owner == p && cpu == owner->core_reserve_cpu;
+    }
+
+    raw_spin_unlock_irqrestore(&core_owner_lock, flags);
+
+    return allowed;
+}
+
 static int core_reserve_check_movable(void)
 {
     struct task_struct *group, *p;
@@ -2632,6 +2659,8 @@ static int claim_desired_core(unsigned int cpu)
             goto out;
         }
     }
+
+	current->core_reserve_cpu = cpu;
 
     // claim every sibling belongingto this core
     for_each_cpu(sibling, &current->core_reserve_siblings)
@@ -2709,11 +2738,20 @@ static long core_reserve_enable(unsigned long cpu)
 		goto out;
 	}
 
-	current->core_reserve_cpu = cpu;
 	current->core_reserve_enabled = true;
 
-	/* Reject ordinary sched_setaffinity() requests. */
+	// reject sched_setaffinity() requests
 	current->flags |= PF_NO_SETAFFINITY;
+
+	{
+        int sibling;
+
+        for_each_cpu(sibling, &current->core_reserve_siblings) {
+            pr_info("core_reserve: owner allowed on CPU %d: %d\n",
+                    sibling,
+                    core_reserve_task_allowed(current, sibling));
+        }
+    }
 
     pr_info("core_reserve: PID %d on CPU %u; SMT CPUs: %*pbl\n",
             task_pid_nr(current),
