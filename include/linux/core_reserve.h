@@ -12,7 +12,7 @@ bool is_core_claimed_already(unsigned int cpu);
 
 static inline void core_reserve_exit(void) {}
 
-static inline bool core_reserve_cpu_claimed(unsigned int cpu)
+static inline bool is_core_claimed_already(unsigned int cpu)
 {
     return false;
 }
