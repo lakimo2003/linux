@@ -2714,23 +2714,25 @@ static long core_reserve_enable(unsigned long cpu)
         goto out;
     }
 
-    // save the original affinity mask so we can restore it later
+    // Save the original affinity
     ret = sched_getaffinity(
         0, &current->core_reserve_saved_mask);
-    if (ret)
+    if (ret) {
         goto out;
-	
-	// reserve the desired core for this thread
-	ret = claim_desired_core(cpu);
-	if (ret)
-		goto out;
+    }
 
-	// reject a core containing a user thread with nowhere else to run
-	ret = core_reserve_check_movable();
-	if (ret) {
-		core_reserve_release_claim();
-		goto out;
-	}
+    // Claim the destination core
+    ret = claim_desired_core(cpu);
+    if (ret) {
+        goto out;
+    }
+
+    // reject threads with nowhere else to run
+    ret = core_reserve_check_movable();
+    if (ret) {
+        core_reserve_release_claim();
+        goto out;
+    }
 
 	ret = sched_setaffinity(0, cpumask_of(cpu));
 	if (ret) {
