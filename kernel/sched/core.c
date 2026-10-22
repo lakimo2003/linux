@@ -28,6 +28,7 @@
 #include <linux/refcount_api.h>
 #include <linux/topology.h>
 #include <linux/sched/clock.h>
+#include <linux/sched/core_reservation.h>
 #include <linux/sched/cond_resched.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/debug.h>
@@ -2993,8 +2994,15 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
 		preempt_disable();
 		task_rq_unlock(rq, p, rf);
 		if (push_task) {
-			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
-					    p, &rq->push_work);
+			if (!stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
+						push_task, &rq->push_work)) {
+				unsigned long irqflags;
+
+				raw_spin_rq_lock_irqsave(rq, irqflags);
+				rq->push_busy = false;
+				raw_spin_rq_unlock_irqrestore(rq, irqflags);
+				put_task_struct(push_task);
+			}
 		}
 		preempt_enable();
 
@@ -3121,6 +3129,11 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 	unsigned int dest_cpu;
 	int ret = 0;
 
+	sched_core_reserve_affinity_lock();
+	ret = sched_core_reserve_affinity_check(p, ctx);
+	if (ret)
+		goto out;
+
 	if (kthread || is_migration_disabled(p)) {
 		/*
 		 * Kernel threads are allowed on online && !active CPUs,
@@ -3169,17 +3182,19 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 	 * for groups of tasks (ie. cpuset), so that load balancing is not
 	 * immediately required to distribute the tasks within their new mask.
 	 */
-	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, ctx->new_mask);
+	dest_cpu = sched_core_reserve_dest(p, ctx->new_mask, cpu_valid_mask);
 	if (dest_cpu >= nr_cpu_ids) {
 		ret = -EINVAL;
 		goto out;
 	}
 
 	do_set_cpus_allowed(p, ctx);
+	sched_core_reserve_affinity_unlock();
 
 	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
 
 out:
+	sched_core_reserve_affinity_unlock();
 	task_rq_unlock(rq, p, rf);
 
 	return ret;
@@ -3205,7 +3220,8 @@ int __set_cpus_allowed_ptr(struct task_struct *p, struct affinity_context *ctx)
 	 * flags are set.
 	 */
 	if (p->user_cpus_ptr &&
-	    !(ctx->flags & (SCA_USER | SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) &&
+	    !(ctx->flags & (SCA_USER | SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE |
+			    SCA_CORE_RESERVE)) &&
 	    cpumask_and(rq->scratch_mask, ctx->new_mask, p->user_cpus_ptr))
 		ctx->new_mask = rq->scratch_mask;
 
@@ -3445,10 +3461,10 @@ static int migrate_swap_stop(void *data)
 	if (task_cpu(arg->src_task) != arg->src_cpu)
 		return -EAGAIN;
 
-	if (!cpumask_test_cpu(arg->dst_cpu, arg->src_task->cpus_ptr))
+	if (!task_allowed_on_cpu(arg->src_task, arg->dst_cpu))
 		return -EAGAIN;
 
-	if (!cpumask_test_cpu(arg->src_cpu, arg->dst_task->cpus_ptr))
+	if (!task_allowed_on_cpu(arg->dst_task, arg->src_cpu))
 		return -EAGAIN;
 
 	__migrate_swap_task(arg->src_task, arg->dst_cpu);
@@ -3483,10 +3499,10 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
 	if (!cpu_active(arg.src_cpu) || !cpu_active(arg.dst_cpu))
 		goto out;
 
-	if (!cpumask_test_cpu(arg.dst_cpu, arg.src_task->cpus_ptr))
+	if (!task_allowed_on_cpu(arg.src_task, arg.dst_cpu))
 		goto out;
 
-	if (!cpumask_test_cpu(arg.src_cpu, arg.dst_task->cpus_ptr))
+	if (!task_allowed_on_cpu(arg.dst_task, arg.src_cpu))
 		goto out;
 
 	trace_sched_swap_numa(cur, arg.src_cpu, p, arg.dst_cpu);
@@ -4023,7 +4039,7 @@ static inline bool ttwu_queue_cond(struct task_struct *p, int cpu)
 		return false;
 
 	/* Ensure the task will still be allowed to run on the CPU. */
-	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+	if (!task_allowed_on_cpu(p, cpu))
 		return false;
 
 	/*
@@ -4802,11 +4818,12 @@ late_initcall(sched_core_sysctl_init);
  */
 int sched_fork(u64 clone_flags, struct task_struct *p)
 {
-	__sched_fork(clone_flags, p);
+	int ret;
 
-	#ifdef CONFIG_SMP
-    	p->core_reserve_enabled = false; // The child must not inherit the parent’s “enabled” state
-	#endif
+	__sched_fork(clone_flags, p);
+	ret = sched_core_reserve_fork(p);
+	if (ret)
+		return ret;
 	/*
 	 * We mark the process as NEW here. This guarantees that
 	 * nobody will actually run it, and a signal or other external
@@ -5361,6 +5378,7 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	finish_task(prev);
 	tick_nohz_task_switch();
 	finish_lock_switch(rq);
+	sched_core_reserve_finish(prev, prev_state);
 	finish_arch_post_lock_switch();
 	kcov_finish_switch(current);
 	/*
@@ -6132,6 +6150,12 @@ __pick_next_task(struct rq *rq, struct rq_flags *rf)
 	struct task_struct *p;
 
 	rq->dl_server = NULL;
+
+	p = sched_core_reserve_pick(rq);
+	if (p) {
+		put_prev_set_next_task(rq, rq->donor, p);
+		return p;
+	}
 
 	if (scx_enabled())
 		goto restart;
@@ -8356,7 +8380,7 @@ int migrate_task_to(struct task_struct *p, int target_cpu)
 	if (curr_cpu == target_cpu)
 		return 0;
 
-	if (!cpumask_test_cpu(target_cpu, p->cpus_ptr))
+	if (!task_allowed_on_cpu(p, target_cpu))
 		return -EINVAL;
 
 	/* TODO: This is not properly updating schedstats */
@@ -11286,3 +11310,7 @@ void sched_change_end(struct sched_change_ctx *ctx)
 		p->sched_class->prio_changed(rq, p, ctx->prio);
 	}
 }
+
+#ifdef CONFIG_SCHED_CORE_RESERVATION
+#include "core_reservation.c"
+#endif

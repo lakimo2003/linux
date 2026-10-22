@@ -14,6 +14,7 @@
 
 /* Headers: */
 #include <linux/sched/clock.h>
+#include <linux/sched/core_reservation.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/hotplug.h>
 #include <linux/sched/isolation.h>

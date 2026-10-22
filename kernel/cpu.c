@@ -21,6 +21,7 @@
 #include <linux/bug.h>
 #include <linux/kthread.h>
 #include <linux/stop_machine.h>
+#include <linux/sched/core_reservation.h>
 #include <linux/mutex.h>
 #include <linux/gfp.h>
 #include <linux/suspend.h>
@@ -1418,6 +1419,11 @@ static int __ref _cpu_down(unsigned int cpu, int tasks_frozen,
 	 * Keep at least one housekeeping cpu onlined to avoid generating
 	 * an empty sched_domain span.
 	 */
+	if (sched_core_reserve_hotplug_busy()) {
+		ret = -EBUSY;
+		goto out;
+	}
+
 	if (cpumask_any_and(cpu_online_mask,
 			    housekeeping_cpumask(HK_TYPE_DOMAIN)) >= nr_cpu_ids) {
 		ret = -EBUSY;
@@ -1620,6 +1626,10 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
 	int ret = 0;
 
 	cpus_write_lock();
+	if (sched_core_reserve_hotplug_busy()) {
+		ret = -EBUSY;
+		goto out;
+	}
 
 	if (!cpu_present(cpu)) {
 		ret = -EINVAL;

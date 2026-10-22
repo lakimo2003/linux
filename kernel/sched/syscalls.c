@@ -571,6 +571,15 @@ recheck:
 	rq = task_rq_lock(p, &rf);
 	update_rq_clock(rq);
 
+#ifdef CONFIG_SCHED_CORE_RESERVATION
+	/* Keep deadline admission and the owner's scheduling policy stable. */
+	if (p->core_reservation ||
+	    (dl_policy(policy) && sched_core_reserve_hotplug_busy())) {
+		retval = -EBUSY;
+		goto unlock;
+	}
+#endif
+
 	/*
 	 * Changing the policy of the stop threads its a very bad idea:
 	 */

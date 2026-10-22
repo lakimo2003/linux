@@ -825,135 +825,131 @@ struct kmap_ctrl {
 
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
-/*
- * For reasons of header soup (see current_thread_info()), this
- * must be the first element of task_struct.
- */
-struct thread_info		thread_info;
+	/*
+	 * For reasons of header soup (see current_thread_info()), this
+	 * must be the first element of task_struct.
+	 */
+	struct thread_info		thread_info;
 #endif
-unsigned int			__state;
+	unsigned int			__state;
 
 	/* saved state for "spinlock sleepers" */
 	unsigned int			saved_state;
-	
+
 	/*
-	* This begins the randomizable portion of task_struct. Only
+	 * This begins the randomizable portion of task_struct. Only
 	 * scheduling-critical items should be added above here.
 	 */
 	randomized_struct_fields_start
-	
+
 	void				*stack;
 	refcount_t			usage;
 	/* Per task flags (PF_*), defined further below: */
 	unsigned int			flags;
 	unsigned int			ptrace;
-	
-	#ifdef CONFIG_MEM_ALLOC_PROFILING
+
+#ifdef CONFIG_MEM_ALLOC_PROFILING
 	struct alloc_tag		*alloc_tag;
-	#endif
-	
+#endif
+
 	u8				on_cpu;
 	u8				on_rq;
 	u8				is_blocked;
 	u8				__pad;
-	
+
 	struct __call_single_node	wake_entry;
 	unsigned int			wakee_flips;
 	unsigned long			wakee_flip_decay_ts;
 	struct task_struct		*last_wakee;
-	
+
 	/*
-	* recent_used_cpu is initially set as the last CPU used by a task
-	* that wakes affine another task. Waker/wakee relationships can
-	* push tasks around a CPU where each wakeup moves to the next one.
-	* Tracking a recently used CPU allows a quick search for a recently
-	* used CPU that may be idle.
-	*/
-int				recent_used_cpu;
+	 * recent_used_cpu is initially set as the last CPU used by a task
+	 * that wakes affine another task. Waker/wakee relationships can
+	 * push tasks around a CPU where each wakeup moves to the next one.
+	 * Tracking a recently used CPU allows a quick search for a recently
+	 * used CPU that may be idle.
+	 */
+	int				recent_used_cpu;
 	int				wake_cpu;
-	
+
 	int				prio;
 	int				static_prio;
 	int				normal_prio;
 	unsigned int			rt_priority;
-	
+
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
 	struct sched_dl_entity		dl;
 	struct sched_dl_entity		*dl_server;
-	#ifdef CONFIG_SCHED_CLASS_EXT
+#ifdef CONFIG_SCHED_CLASS_EXT
 	struct sched_ext_entity		scx;
-	#endif
+#endif
 	const struct sched_class	*sched_class;
-	
+
 #ifdef CONFIG_SCHED_CORE
-struct rb_node			core_node;
-unsigned long			core_cookie;
-unsigned int			core_occupation;
+	struct rb_node			core_node;
+	unsigned long			core_cookie;
+	unsigned int			core_occupation;
 #endif
 
 #ifdef CONFIG_CGROUP_SCHED
-struct task_group		*sched_task_group;
+	struct task_group		*sched_task_group;
 #ifdef CONFIG_CFS_BANDWIDTH
-struct callback_head		sched_throttle_work;
-struct list_head		throttle_node;
-bool				throttled;
+	struct callback_head		sched_throttle_work;
+	struct list_head		throttle_node;
+	bool				throttled;
 #endif
 #endif
 
 
 #ifdef CONFIG_UCLAMP_TASK
-/*
-* Clamp values requested for a scheduling entity.
-* Must be updated with task_rq_lock() held.
-*/
-struct uclamp_se		uclamp_req[UCLAMP_CNT];
-/*
-* Effective clamp values used for a scheduling entity.
-* Must be updated with task_rq_lock() held.
-*/
-struct uclamp_se		uclamp[UCLAMP_CNT];
+	/*
+	 * Clamp values requested for a scheduling entity.
+	 * Must be updated with task_rq_lock() held.
+	 */
+	struct uclamp_se		uclamp_req[UCLAMP_CNT];
+	/*
+	 * Effective clamp values used for a scheduling entity.
+	 * Must be updated with task_rq_lock() held.
+	 */
+	struct uclamp_se		uclamp[UCLAMP_CNT];
 #endif
 
-struct sched_statistics         stats;
+	struct sched_statistics         stats;
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
-/* List of struct preempt_notifier: */
-struct hlist_head		preempt_notifiers;
+	/* List of struct preempt_notifier: */
+	struct hlist_head		preempt_notifiers;
 #endif
 
 #ifdef CONFIG_BLK_DEV_IO_TRACE
 	unsigned int			btrace_seq;
 #endif
 
-unsigned int			policy;
-unsigned long			max_allowed_capacity;
-int				nr_cpus_allowed;
-const cpumask_t			*cpus_ptr;
-cpumask_t			*user_cpus_ptr;
-cpumask_t			cpus_mask;
+	unsigned int			policy;
+	unsigned long			max_allowed_capacity;
+	int				nr_cpus_allowed;
+	const cpumask_t			*cpus_ptr;
 
-#ifdef CONFIG_SMP
-	bool core_reserve_enabled; //has this thread enabled our mitigation?
-	cpumask_t core_reserve_saved_mask; // what affinity should disable restore?
-	unsigned int core_reserve_cpu; // CPU where the victim runs 
-	cpumask_t core_reserve_siblings; // all logical CPUs of that physical core, including the selected CPU
+#ifdef CONFIG_SCHED_CORE_RESERVATION
+	struct sched_core_reservation	*core_reservation;
 #endif
-
-void				*migration_pending;
-unsigned short			migration_disabled;
-unsigned short			migration_flags;
+	cpumask_t			*user_cpus_ptr;
+	cpumask_t			cpus_mask;
+	void				*migration_pending;
+	unsigned short			migration_disabled;
+	unsigned short			migration_flags;
 
 #ifdef CONFIG_PREEMPT_RCU
-int				rcu_read_lock_nesting;
-union rcu_special		rcu_read_unlock_special;
-struct list_head		rcu_node_entry;
-struct rcu_node			*rcu_blocked_node;
+	int				rcu_read_lock_nesting;
+	union rcu_special		rcu_read_unlock_special;
+	struct list_head		rcu_node_entry;
+	struct rcu_node			*rcu_blocked_node;
 #endif /* #ifdef CONFIG_PREEMPT_RCU */
 
 #ifdef CONFIG_TASKS_RCU
-unsigned long			rcu_tasks_nvcsw;
-u8				rcu_tasks_holdout;
+	unsigned long			rcu_tasks_nvcsw;
+	u8				rcu_tasks_holdout;
 	u8				rcu_tasks_idx;
 	int				rcu_tasks_idle_cpu;
 	struct list_head		rcu_tasks_holdout_list;

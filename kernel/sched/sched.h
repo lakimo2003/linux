@@ -2725,7 +2725,7 @@ struct sched_class {
 	void (*task_change_group)(struct task_struct *p);
 #endif
 
-#ifdef CONFIG_SCHED_CORE
+#if defined(CONFIG_SCHED_CORE) || defined(CONFIG_SCHED_CORE_RESERVATION)
 	/*
 	 * pick_next_task: rq->lock
 	 * try_steal_cookie: rq->lock (double)
@@ -2863,6 +2863,44 @@ extern struct task_struct *pick_task_idle(struct rq *rq, struct rq_flags *rf);
 #define SCA_MIGRATE_DISABLE	0x02
 #define SCA_MIGRATE_ENABLE	0x04
 #define SCA_USER		0x08
+#define SCA_CORE_RESERVE	0x10
+
+#ifdef CONFIG_SCHED_CORE_RESERVATION
+bool sched_core_reserve_allowed(struct task_struct *p, int cpu);
+void sched_core_reserve_affinity_lock(void);
+void sched_core_reserve_affinity_unlock(void);
+int sched_core_reserve_affinity_check(struct task_struct *p,
+				    struct affinity_context *ctx);
+int sched_core_reserve_dest(struct task_struct *p, const struct cpumask *mask,
+			    const struct cpumask *valid);
+struct task_struct *sched_core_reserve_pick(struct rq *rq);
+void sched_core_reserve_finish(struct task_struct *prev, unsigned int state);
+int sched_core_reserve_fork(struct task_struct *p);
+#else
+static inline bool sched_core_reserve_allowed(struct task_struct *p, int cpu)
+{
+	return true;
+}
+static inline void sched_core_reserve_affinity_lock(void) { }
+static inline void sched_core_reserve_affinity_unlock(void) { }
+static inline int sched_core_reserve_affinity_check(struct task_struct *p,
+						   struct affinity_context *ctx)
+{
+	return 0;
+}
+static inline int sched_core_reserve_dest(struct task_struct *p,
+		const struct cpumask *mask, const struct cpumask *valid)
+{
+	return cpumask_any_and_distribute(valid, mask);
+}
+static inline struct task_struct *sched_core_reserve_pick(struct rq *rq)
+{
+	return NULL;
+}
+static inline void sched_core_reserve_finish(struct task_struct *prev,
+					    unsigned int state) { }
+static inline int sched_core_reserve_fork(struct task_struct *p) { return 0; }
+#endif
 
 extern void update_group_capacity(struct sched_domain *sd, int cpu);
 
@@ -2875,6 +2913,8 @@ static inline bool task_allowed_on_cpu(struct task_struct *p, int cpu)
 {
 	/* When not in the task's cpumask, no point in looking further. */
 	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+		return false;
+	if (!sched_core_reserve_allowed(p, cpu))
 		return false;
 
 	/* Can @cpu run a user thread? */
@@ -4132,7 +4172,8 @@ static inline
 bool task_is_pushable(struct rq *rq, struct task_struct *p, int cpu)
 {
 	if (!task_on_cpu(rq, p) &&
-	    cpumask_test_cpu(cpu, &p->cpus_mask))
+	    cpumask_test_cpu(cpu, &p->cpus_mask) &&
+	    sched_core_reserve_allowed(p, cpu))
 		return true;
 
 	return false;

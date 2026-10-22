@@ -12,6 +12,7 @@
 #include <linux/mman.h>
 #include <linux/reboot.h>
 #include <linux/prctl.h>
+#include <linux/sched/core_reservation.h>
 #include <linux/highuid.h>
 #include <linux/fs.h>
 #include <linux/kmod.h>
@@ -76,16 +77,7 @@
 #include <asm/io.h>
 #include <asm/unistd.h>
 
-#include <linux/cpu.h>
-#include <linux/cpumask.h>
-#include <linux/sched.h>
-#include <linux/topology.h>
-#include <linux/mutex.h>
-#include <linux/core_reserve.h>
-
 #include <trace/events/task.h>
-#include <linux/sched/signal.h>
-#include <linux/spinlock.h>
 
 #include "uid16.h"
 
@@ -2540,264 +2532,6 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 	return 0;
 }
 
-#if defined(CONFIG_X86) && defined(CONFIG_SMP)
-
-/* Both SMT siblings point to the same owning thread. */
-static struct task_struct *core_owner[NR_CPUS];
-
-// protects access to core_owner[]
-static DEFINE_RAW_SPINLOCK(core_owner_lock);
-
-bool is_core_claimed_already(unsigned int cpu)
-{
-    unsigned long flags;
-    bool claimed;
-
-    if (cpu >= nr_cpu_ids)
-        return false;
-
-    raw_spin_lock_irqsave(&core_owner_lock, flags);
-
-    claimed = core_owner[cpu] != NULL;
-
-    raw_spin_unlock_irqrestore(&core_owner_lock, flags);
-
-    return claimed;
-}
-
-bool core_reserve_task_allowed(struct task_struct *p,
-                               unsigned int cpu)
-{
-    struct task_struct *owner;
-    unsigned long flags;
-    bool allowed;
-
-    if (cpu >= nr_cpu_ids)
-        return false;
-
-    raw_spin_lock_irqsave(&core_owner_lock, flags);
-
-    owner = core_owner[cpu];
-
-    if (!owner) {
-        // No reservations on this CPU
-        allowed = true;
-    } else {
-        // The only thread allowed to run on this CPU is the owner thread itself
-        allowed = owner == p && cpu == owner->core_reserve_cpu;
-    }
-
-    raw_spin_unlock_irqrestore(&core_owner_lock, flags);
-
-    return allowed;
-}
-
-static int core_reserve_check_movable(void)
-{
-    struct task_struct *group, *p;
-    unsigned long flags;
-    int cpu;
-    int ret = 0;
-    bool can_move;
-
-    rcu_read_lock();
-
-    for_each_process_thread(group, p) {
-        // skip current thread and kernel threads
-        if (p == current || (READ_ONCE(p->flags) & PF_KTHREAD))
-            continue;
-
-        raw_spin_lock_irqsave(&p->pi_lock, flags);
-
-        // threads with no affinity overlap don't need to be moved, they are on a different core
-        if (!cpumask_intersects(&p->cpus_mask,
-                                &current->core_reserve_siblings)) {
-            raw_spin_unlock_irqrestore(&p->pi_lock, flags);
-            continue;
-        }
-
-        can_move = false;
-
-        // find an active, allowed CPU outside our core
-        for_each_cpu_and(cpu, &p->cpus_mask, cpu_active_mask) {
-            if (!is_core_claimed_already(cpu)) {
-                can_move = true;
-                break;
-            }
-        }
-
-        raw_spin_unlock_irqrestore(&p->pi_lock, flags);
-
-        if (!can_move) {
-            ret = -EBUSY;
-            goto out;
-        }
-    }
-
-out:
-    rcu_read_unlock();
-    return ret;
-}
-
-
-static int claim_desired_core(unsigned int cpu)
-{
-	unsigned long flags;
-    int sibling;
-    int ret = 0;
-
-    // cpus_read_lock() is already held by the caller
-    cpumask_copy(&current->core_reserve_siblings,
-                 topology_sibling_cpumask(cpu));
-
-    raw_spin_lock_irqsave(&core_owner_lock, flags);
-
-    // check that no other thread has claimed any of the SMT siblings
-    for_each_cpu(sibling, &current->core_reserve_siblings) {
-        if (core_owner[sibling]) {
-            ret = -EBUSY;
-            goto out;
-        }
-    }
-
-	current->core_reserve_cpu = cpu;
-
-    // claim every sibling belongingto this core
-    for_each_cpu(sibling, &current->core_reserve_siblings)
-        core_owner[sibling] = current;
-
-out:
-    raw_spin_unlock_irqrestore(&core_owner_lock, flags);
-    return ret;
-}
-
-static void core_reserve_release_claim(void)
-{
-	unsigned long flags;
-    int sibling;
-
-    raw_spin_lock_irqsave(&core_owner_lock, flags);
-
-    for_each_cpu(sibling, &current->core_reserve_siblings) {
-        if (core_owner[sibling] == current)
-            core_owner[sibling] = NULL;
-    }
-
-    current->core_reserve_enabled = false;
-
-    raw_spin_unlock_irqrestore(&core_owner_lock, flags);
-}
-
-void core_reserve_exit(void)
-{
-    if (current->core_reserve_enabled)
-        core_reserve_release_claim();
-}
-
-#endif
-
-static long core_reserve_enable(unsigned long cpu)
-{
-#if defined(CONFIG_X86) && defined(CONFIG_SMP)
-    long ret;
-
-    if (current->core_reserve_enabled)
-        return -EALREADY;
-
-    if (cpu >= nr_cpu_ids)
-        return -EINVAL;
-
-    cpus_read_lock();
-
-    if (!cpu_active(cpu)) {
-        ret = -EINVAL;
-        goto out;
-    }
-
-    // Save the original affinity
-    ret = sched_getaffinity(
-        0, &current->core_reserve_saved_mask);
-    if (ret) {
-        goto out;
-    }
-
-    // Claim the destination core
-    ret = claim_desired_core(cpu);
-    if (ret) {
-        goto out;
-    }
-
-    // reject threads with nowhere else to run
-    ret = core_reserve_check_movable();
-    if (ret) {
-        core_reserve_release_claim();
-        goto out;
-    }
-
-	ret = sched_setaffinity(0, cpumask_of(cpu));
-	if (ret) {
-		core_reserve_release_claim();
-		goto out;
-	}
-
-	current->core_reserve_enabled = true;
-
-	// reject sched_setaffinity() requests
-	current->flags |= PF_NO_SETAFFINITY;
-
-	{
-        int sibling;
-
-        for_each_cpu(sibling, &current->core_reserve_siblings) {
-            pr_info("core_reserve: owner allowed on CPU %d: %d\n",
-                    sibling,
-                    core_reserve_task_allowed(current, sibling));
-        }
-    }
-
-    pr_info("core_reserve: PID %d on CPU %u; SMT CPUs: %*pbl\n",
-            task_pid_nr(current),
-            current->core_reserve_cpu,
-            cpumask_pr_args(&current->core_reserve_siblings));
-
-out:
-    cpus_read_unlock();
-    return ret;
-#else
-    return -EOPNOTSUPP;
-#endif
-}
-
-static long core_reserve_disable(void)
-{
-#if defined(CONFIG_X86) && defined(CONFIG_SMP)
-    long ret;
-
-    if (!current->core_reserve_enabled)
-        return -EINVAL;
-
-    cpus_read_lock();
-
-    // restore the original affinity mask 
-    current->flags &= ~PF_NO_SETAFFINITY;
-
-    ret = sched_setaffinity(
-        0, &current->core_reserve_saved_mask);
-
-    if (ret) {
-		// restoring the original affinity mask failed
-        current->flags |= PF_NO_SETAFFINITY;
-    } else {
-        core_reserve_release_claim();
-    }
-
-    cpus_read_unlock();
-    return ret;
-#else
-    return -EOPNOTSUPP;
-#endif
-}
-
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
@@ -2811,26 +2545,6 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 
 	error = 0;
 	switch (option) {
-	case PR_SCHED_CORE_RESERVE:
-		if (arg4 || arg5) {
-			error = -EINVAL;
-			break;
-		}
-
-		switch (arg2) {
-		case PR_SCHED_CORE_RESERVE_ENABLE:
-			error = core_reserve_enable(arg3);
-			break;
-
-		case PR_SCHED_CORE_RESERVE_DISABLE:
-			error = arg3 ? -EINVAL : core_reserve_disable();
-			break;
-
-		default:
-			error = -EINVAL;
-			break;
-		}
-		break;
 	case PR_SET_PDEATHSIG:
 		if (!valid_signal(arg2)) {
 			error = -EINVAL;
@@ -3095,6 +2809,9 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		error = sched_core_share_pid(arg2, arg3, arg4, arg5);
 		break;
 #endif
+	case PR_SCHED_CORE_RESERVE:
+		error = sched_core_reserve_prctl(arg2, arg3, arg4, arg5);
+		break;
 	case PR_SET_MDWE:
 		error = prctl_set_mdwe(arg2, arg3, arg4, arg5);
 		break;

@@ -166,6 +166,23 @@ config SCHED_CORE
 	  which is the likely usage by Linux distributions, there should
 	  be no measurable impact on performance.
 
+config SCHED_CORE_RESERVATION
+	bool "Experimental exclusive SMT core reservations"
+	depends on X86_64 && SCHED_SMT && EXPERT
+	depends on !SCHED_CORE && !SCHED_CLASS_EXT && !SCHED_PROXY_EXEC
+	depends on !CPUSETS && !PREEMPT_RT
+	help
+	  Allow a privileged thread to reserve an entire physical core through
+	  PR_SCHED_CORE_RESERVE. Only the owner and idle tasks may execute on
+	  the reserved core, including while the owner sleeps. Reservations
+	  synchronously drain other tasks, block CPU stopper work and hotplug,
+	  preserve affinity, and are released after the owner's final switch.
+
+	  This is an experimental research interface. Per-CPU kernel work is
+	  deferred while a core is reserved: the owner must not wait for work
+	  that needs that core. Interrupts, NMIs and firmware are not excluded.
+	  See Documentation/admin-guide/core-reservation.rst.
+
 config SCHED_CLASS_EXT
 	bool "Extensible Scheduling Class"
 	depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF
