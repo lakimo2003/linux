@@ -84,6 +84,8 @@
 #include <linux/core_reserve.h>
 
 #include <trace/events/task.h>
+#include <linux/sched/signal.h>
+#include <linux/spinlock.h>
 
 #include "uid16.h"
 
@@ -2540,27 +2542,89 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
 
+bool is_core_claimed_already(unsigned int cpu)
+{
+    unsigned long flags;
+    bool claimed;
+
+    if (cpu >= nr_cpu_ids)
+        return false;
+
+    raw_spin_lock_irqsave(&core_owner_lock, flags);
+
+    claimed = core_owner[cpu] != NULL;
+
+    raw_spin_unlock_irqrestore(&core_owner_lock, flags);
+
+    return claimed;
+}
+
+static int core_reserve_check_movable(void)
+{
+    struct task_struct *group, *p;
+    unsigned long flags;
+    int cpu;
+    int ret = 0;
+    bool can_move;
+
+    rcu_read_lock();
+
+    for_each_process_thread(group, p) {
+        // skip current thread and kernel threads
+        if (p == current || (READ_ONCE(p->flags) & PF_KTHREAD))
+            continue;
+
+        raw_spin_lock_irqsave(&p->pi_lock, flags);
+
+        // threads with no affinity overlap don't need to be moved, they are on a different core
+        if (!cpumask_intersects(&p->cpus_mask,
+                                &current->core_reserve_siblings)) {
+            raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+            continue;
+        }
+
+        can_move = false;
+
+        // find an active, allowed CPU outside our core
+        for_each_cpu_and(cpu, &p->cpus_mask, cpu_active_mask) {
+            if (!is_core_claimed_already(cpu)) {
+                can_move = true;
+                break;
+            }
+        }
+
+        raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+        if (!can_move) {
+            ret = -EBUSY;
+            goto out;
+        }
+    }
+
+out:
+    rcu_read_unlock();
+    return ret;
+}
+
 /* Both SMT siblings point to the same owning thread. */
 static struct task_struct *core_owner[NR_CPUS];
 
-/* Protects every access to core_owner[]. */
-static DEFINE_MUTEX(core_owner_mutex);
+// protects access to core_owner[]
+static DEFINE_RAW_SPINLOCK(core_owner_lock);
 
 static int claim_desired_core(unsigned int cpu)
 {
+	unsigned long flags;
     int sibling;
     int ret = 0;
 
-    /*
-     * The enable helper already holds cpus_read_lock(),
-     * so topology cannot change during this operation.
-     */
+    // cpus_read_lock() is already held by the caller
     cpumask_copy(&current->core_reserve_siblings,
                  topology_sibling_cpumask(cpu));
 
-    mutex_lock(&core_owner_mutex);
+    raw_spin_lock_irqsave(&core_owner_lock, flags);
 
-    /* First check the entire core, without changing anything. */
+    // check that no other thread has claimed any of the SMT siblings
     for_each_cpu(sibling, &current->core_reserve_siblings) {
         if (core_owner[sibling]) {
             ret = -EBUSY;
@@ -2568,20 +2632,21 @@ static int claim_desired_core(unsigned int cpu)
         }
     }
 
-    /* Claim every logical CPU belonging to this core. */
+    // claim every sibling belongingto this core
     for_each_cpu(sibling, &current->core_reserve_siblings)
         core_owner[sibling] = current;
 
 out:
-    mutex_unlock(&core_owner_mutex);
+    raw_spin_unlock_irqrestore(&core_owner_lock, flags);
     return ret;
 }
 
 static void core_reserve_release_claim(void)
 {
+	unsigned long flags;
     int sibling;
 
-    mutex_lock(&core_owner_mutex);
+    raw_spin_lock_irqsave(&core_owner_lock, flags);
 
     for_each_cpu(sibling, &current->core_reserve_siblings) {
         if (core_owner[sibling] == current)
@@ -2590,7 +2655,7 @@ static void core_reserve_release_claim(void)
 
     current->core_reserve_enabled = false;
 
-    mutex_unlock(&core_owner_mutex);
+    raw_spin_unlock_irqrestore(&core_owner_lock, flags);
 }
 
 void core_reserve_exit(void)
@@ -2619,27 +2684,35 @@ static long core_reserve_enable(unsigned long cpu)
         goto out;
     }
 
-    /* Save the original effective affinity. */
+    // save the original affinity mask so we can restore it later
     ret = sched_getaffinity(
         0, &current->core_reserve_saved_mask);
     if (ret)
         goto out;
-
-	/* Claim the destination core. */
+	
+	// reserve the desired core for this thread
 	ret = claim_desired_core(cpu);
 	if (ret)
 		goto out;
 
-	/* Move the owner to the requested logical CPU. */
+	// reject a core containing a user thread with nowhere else to run
+	ret = core_reserve_check_movable();
+	if (ret) {
+		core_reserve_release_claim();
+		goto out;
+	}
+
 	ret = sched_setaffinity(0, cpumask_of(cpu));
 	if (ret) {
-		/* Migration failed: do not leave a claim behind. */
 		core_reserve_release_claim();
 		goto out;
 	}
 
 	current->core_reserve_cpu = cpu;
 	current->core_reserve_enabled = true;
+
+	/* Reject ordinary sched_setaffinity() requests. */
+	current->flags |= PF_NO_SETAFFINITY;
 
     pr_info("core_reserve: PID %d on CPU %u; SMT CPUs: %*pbl\n",
             task_pid_nr(current),
@@ -2664,11 +2737,18 @@ static long core_reserve_disable(void)
 
     cpus_read_lock();
 
+    // restore the original affinity mask 
+    current->flags &= ~PF_NO_SETAFFINITY;
+
     ret = sched_setaffinity(
         0, &current->core_reserve_saved_mask);
 
-    if (!ret)
+    if (ret) {
+		// restoring the original affinity mask failed
+        current->flags |= PF_NO_SETAFFINITY;
+    } else {
         core_reserve_release_claim();
+    }
 
     cpus_read_unlock();
     return ret;
