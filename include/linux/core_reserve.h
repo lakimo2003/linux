@@ -4,6 +4,11 @@
 #include <linux/types.h>
 struct task_struct;
 
+enum core_reserve_state {
+	CORE_RESERVE_NONE = 0,
+	CORE_RESERVE_DRAINING,
+};
+
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
 
 void core_reserve_exit(void);

@@ -2544,6 +2544,7 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 
 /* Both SMT siblings point to the same owning thread. */
 static struct task_struct *core_owner[NR_CPUS];
+static enum core_reserve_state core_state[NR_CPUS];
 
 // protects access to core_owner[]
 static DEFINE_RAW_SPINLOCK(core_owner_lock);
@@ -2580,10 +2581,14 @@ bool core_reserve_task_allowed(struct task_struct *p,
     owner = core_owner[cpu];
 
     if (!owner) {
-        // No reservations on this CPU
+        /* No reservation restricts this CPU. */
+        allowed = true;
+    } else if (core_state[cpu] == CORE_RESERVE_DRAINING &&
+               (READ_ONCE(p->flags) & PF_KTHREAD)) {
+        /* Keep kernel setup and migration work possible while draining. */
         allowed = true;
     } else {
-        // The only thread allowed to run on this CPU is the owner thread itself
+        /* Allow the owner only on its selected logical CPU. */
         allowed = owner == p && cpu == owner->core_reserve_cpu;
     }
 
@@ -2663,8 +2668,10 @@ static int claim_desired_core(unsigned int cpu)
 	current->core_reserve_cpu = cpu;
 
     // claim every sibling belongingto this core
-    for_each_cpu(sibling, &current->core_reserve_siblings)
+    for_each_cpu(sibling, &current->core_reserve_siblings) {
         core_owner[sibling] = current;
+        core_state[sibling] = CORE_RESERVE_DRAINING;
+    }
 
 out:
     raw_spin_unlock_irqrestore(&core_owner_lock, flags);
@@ -2679,8 +2686,10 @@ static void core_reserve_release_claim(void)
     raw_spin_lock_irqsave(&core_owner_lock, flags);
 
     for_each_cpu(sibling, &current->core_reserve_siblings) {
-        if (core_owner[sibling] == current)
+        if (core_owner[sibling] == current) {
             core_owner[sibling] = NULL;
+            core_state[sibling] = CORE_RESERVE_NONE;
+        }
     }
 
     current->core_reserve_enabled = false;
