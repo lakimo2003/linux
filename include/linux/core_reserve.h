@@ -6,7 +6,7 @@
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
 
 void core_reserve_exit(void);
-bool core_reserve_cpu_claimed(unsigned int cpu);
+bool is_core_claimed_already(unsigned int cpu);
 
 #else
 

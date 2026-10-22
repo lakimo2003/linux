@@ -2542,6 +2542,12 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
 
+/* Both SMT siblings point to the same owning thread. */
+static struct task_struct *core_owner[NR_CPUS];
+
+// protects access to core_owner[]
+static DEFINE_RAW_SPINLOCK(core_owner_lock);
+
 bool is_core_claimed_already(unsigned int cpu)
 {
     unsigned long flags;
@@ -2606,11 +2612,6 @@ out:
     return ret;
 }
 
-/* Both SMT siblings point to the same owning thread. */
-static struct task_struct *core_owner[NR_CPUS];
-
-// protects access to core_owner[]
-static DEFINE_RAW_SPINLOCK(core_owner_lock);
 
 static int claim_desired_core(unsigned int cpu)
 {
