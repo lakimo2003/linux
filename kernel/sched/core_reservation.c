@@ -42,6 +42,7 @@ bool sched_core_reserve_hotplug_busy(void)
 	return rcu_access_pointer(core_reservation) != NULL;
 }
 
+// check if a task can use a CPU under the active SMT reserve
 bool sched_core_reserve_allowed(struct task_struct *p, int cpu)
 {
 	struct sched_core_reservation *reserved_cpu;
@@ -57,8 +58,11 @@ bool sched_core_reserve_allowed(struct task_struct *p, int cpu)
 	if (reserved_cpu && !cpumask_test_cpu(cpu, reserved_cpu->siblings))
 		reserved_cpu = NULL;
 
+	// owner can stay on its own reserved CPU
 	allowed = !reserved_cpu || (reserved_cpu->owner == p && reserved_cpu->cpu == cpu);
 	
+	// allow a task to finish a migrate_disable region on the same CPU
+	// while reserve is draining, so it does not get stuck mid-migration
 	if (reserved_cpu &&
 	    READ_ONCE(reserved_cpu->state) == CORE_RESERVE_DRAINING &&
 	    is_migration_disabled(p) && task_cpu(p) == cpu)
@@ -136,6 +140,8 @@ int sched_core_reserve_affinity_check(struct task_struct *p,
 	return 0;
 }
 
+// task fork must not inherit reserve ownership
+// also must still have a valid CPU after reserve is applied
 int sched_core_reserve_fork(struct task_struct *p)
 {
 	unsigned long flags;
@@ -355,6 +361,8 @@ unlock:
 	return ret;
 }
 
+// walk all tasks and evict the ones on the reserved SMT siblings
+// retry until no more tasks are in the way
 static int core_reserve_drain(struct sched_core_reservation *r)
 {
 	struct core_reserve_task *item, *next;
@@ -419,7 +427,7 @@ static int core_reserve_enable(unsigned int cpu)
 		goto free;
 	}
 	cpumask_copy(reserved_cpu->siblings, cpu_smt_mask(cpu));
-	/* All siblings must be active; hotplug cannot change this until release. */
+	
 	if (!cpumask_subset(reserved_cpu->siblings, cpu_active_mask) ||
 	    cpumask_equal(reserved_cpu->siblings, cpu_active_mask)) {
 		ret = -EBUSY;
@@ -456,7 +464,7 @@ unlock:
 	ret = __set_cpus_allowed_ptr(current, &affinity_context);
 	if (ret)
 		goto rollback;
-	/* Close affinity admission before draining accepted migration requests. */
+	
 	raw_spin_lock_irqsave(&core_reserve_lock, flags);
 	reserved_cpu->closing = true;
 	raw_spin_unlock_irqrestore(&core_reserve_lock, flags);
