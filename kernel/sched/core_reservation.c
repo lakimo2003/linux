@@ -393,10 +393,11 @@ static int core_reserve_drain(struct sched_core_reservation *r)
 
 static int core_reserve_enable(unsigned int cpu)
 {
-	struct sched_core_reservation *r;
-	struct affinity_context ac;
-	unsigned long flags, deadline;
-	struct rq_flags rf;
+	struct sched_core_reservation *reserved_cpu;
+	struct affinity_context affinity_context;
+	unsigned long flags;
+	unsigned long deadline;
+	struct rq_flags rq_flags;
 	struct rq *rq;
 	int ret;
 
@@ -408,28 +409,28 @@ static int core_reserve_enable(unsigned int cpu)
 		return -EINVAL;
 	if (is_migration_disabled(current) || current->migration_pending)
 		return -EBUSY;
-	r = kzalloc_obj(*r, GFP_KERNEL);
-	if (!r)
+	reserved_cpu = kzalloc_obj(*reserved_cpu, GFP_KERNEL);
+	if (!reserved_cpu)
 		return -ENOMEM;
-	if (!zalloc_cpumask_var(&r->siblings, GFP_KERNEL) ||
-	    !zalloc_cpumask_var(&r->saved_mask, GFP_KERNEL) ||
-	    !zalloc_cpumask_var(&r->acknowledged, GFP_KERNEL)) {
+	if (!zalloc_cpumask_var(&reserved_cpu->siblings, GFP_KERNEL) ||
+	    !zalloc_cpumask_var(&reserved_cpu->saved_mask, GFP_KERNEL) ||
+	    !zalloc_cpumask_var(&reserved_cpu->acknowledged, GFP_KERNEL)) {
 		ret = -ENOMEM;
 		goto free;
 	}
-	cpumask_copy(r->siblings, cpu_smt_mask(cpu));
+	cpumask_copy(reserved_cpu->siblings, cpu_smt_mask(cpu));
 	/* All siblings must be active; hotplug cannot change this until release. */
-	if (!cpumask_subset(r->siblings, cpu_active_mask) ||
-	    cpumask_equal(r->siblings, cpu_active_mask)) {
+	if (!cpumask_subset(reserved_cpu->siblings, cpu_active_mask) ||
+	    cpumask_equal(reserved_cpu->siblings, cpu_active_mask)) {
 		ret = -EBUSY;
 		goto free;
 	}
-	r->owner = current;
-	r->cpu = cpu;
-	r->state = CORE_RESERVE_DRAINING;
-	INIT_WORK(&r->release_work, core_reserve_release_work);
+	reserved_cpu->owner = current;
+	reserved_cpu->cpu = cpu;
+	reserved_cpu->state = CORE_RESERVE_DRAINING;
+	INIT_WORK(&reserved_cpu->release_work, core_reserve_release_work);
 
-	rq = task_rq_lock(current, &rf);
+	rq = task_rq_lock(current, &rq_flags);
 	raw_spin_lock(&core_reserve_lock);
 	ret = -EBUSY;
 	if (rcu_access_pointer(core_reservation))
@@ -437,33 +438,33 @@ static int core_reserve_enable(unsigned int cpu)
 	ret = -EINVAL;
 	if (!cpumask_test_cpu(cpu, &current->cpus_mask))
 		goto unlock;
-	cpumask_copy(r->saved_mask, &current->cpus_mask);
+	cpumask_copy(reserved_cpu->saved_mask, &current->cpus_mask);
 	get_task_struct(current);
-	WRITE_ONCE(current->core_reservation, r);
-	rcu_assign_pointer(core_reservation, r);
+	WRITE_ONCE(current->core_reservation, reserved_cpu);
+	rcu_assign_pointer(core_reservation, reserved_cpu);
 	ret = 0;
 unlock:
 	raw_spin_unlock(&core_reserve_lock);
-	task_rq_unlock(rq, current, &rf);
+	task_rq_unlock(rq, current, &rq_flags);
 	if (ret)
 		goto free;
 
-	ac = (struct affinity_context){
+	affinity_context = (struct affinity_context){
 		.new_mask = cpumask_of(cpu),
 		.flags = SCA_CORE_RESERVE,
 	};
-	ret = __set_cpus_allowed_ptr(current, &ac);
+	ret = __set_cpus_allowed_ptr(current, &affinity_context);
 	if (ret)
 		goto rollback;
 	/* Close affinity admission before draining accepted migration requests. */
 	raw_spin_lock_irqsave(&core_reserve_lock, flags);
-	r->closing = true;
+	reserved_cpu->closing = true;
 	raw_spin_unlock_irqrestore(&core_reserve_lock, flags);
 	deadline = jiffies + HZ;
 	do {
-		ret = core_reserve_drain(r);
+		ret = core_reserve_drain(reserved_cpu);
 		if (!ret)
-			ret = cpu_stop_reserve(r->siblings);
+			ret = cpu_stop_reserve(reserved_cpu->siblings);
 		if (!ret)
 			break;
 		if (ret != -EAGAIN && ret != -EBUSY)
@@ -478,11 +479,11 @@ unlock:
 		ret = -EBUSY;
 		goto rollback;
 	}
-	WRITE_ONCE(r->stop_frozen, true);
+	WRITE_ONCE(reserved_cpu->stop_frozen, true);
 	/* Publish the gate before requesting post-switch acknowledgments. */
-	smp_store_release(&r->state, CORE_RESERVE_ACTIVE);
-	core_reserve_resched(r->siblings);
-	while (!cpumask_equal(r->siblings, r->acknowledged)) {
+	smp_store_release(&reserved_cpu->state, CORE_RESERVE_ACTIVE);
+	core_reserve_resched(reserved_cpu->siblings);
+	while (!cpumask_equal(reserved_cpu->siblings, reserved_cpu->acknowledged)) {
 		if (time_after_eq(jiffies, deadline) ||
 		    fatal_signal_pending(current)) {
 			ret = -EBUSY;
@@ -495,7 +496,7 @@ unlock:
 	 * After the barrier outsiders are off-CPU, so queued migration needs no
 	 * stopper. Placement now checks admission under the reservation lock.
 	 */
-	ret = core_reserve_drain(r);
+	ret = core_reserve_drain(reserved_cpu);
 	if (ret)
 		goto rollback;
 	/* Each sibling acknowledged a post-switch safe execution context. */
@@ -503,20 +504,20 @@ unlock:
 	/* Do not return to protected userspace until every sibling is safe. */
 	WARN_ON_ONCE(raw_smp_processor_id() != cpu);
 	pr_info("core_reserve: ACTIVE PID %d on CPU %u; SMT CPUs: %*pbl\n",
-		task_pid_nr(current), cpu, cpumask_pr_args(r->siblings));
+		task_pid_nr(current), cpu, cpumask_pr_args(reserved_cpu->siblings));
 	return 0;
 
 rollback:
 	/* saved_mask includes cpu, so restoration needs no frozen stopper. */
 	ret = ret ?: -EBUSY;
-	WARN_ON_ONCE(core_reserve_restore(r));
-	core_reserve_remove(r);
+	WARN_ON_ONCE(core_reserve_restore(reserved_cpu));
+	core_reserve_remove(reserved_cpu);
 	return ret;
 free:
-	free_cpumask_var(r->siblings);
-	free_cpumask_var(r->saved_mask);
-	free_cpumask_var(r->acknowledged);
-	kfree(r);
+	free_cpumask_var(reserved_cpu->siblings);
+	free_cpumask_var(reserved_cpu->saved_mask);
+	free_cpumask_var(reserved_cpu->acknowledged);
+	kfree(reserved_cpu);
 	return ret;
 }
 
