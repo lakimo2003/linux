@@ -44,22 +44,30 @@ bool sched_core_reserve_hotplug_busy(void)
 
 bool sched_core_reserve_allowed(struct task_struct *p, int cpu)
 {
-	struct sched_core_reservation *r;
+	struct sched_core_reservation *reserved_cpu;
 	bool allowed;
 
-	/* Per-CPU kernel work stays queued locally, but cannot execute ACTIVE. */
+	// if task is a per-cpu kernel thread, it is allowed to run on any CPU
 	if (kthread_is_per_cpu(p))
 		return true;
 	rcu_read_lock();
-	r = rcu_dereference(core_reservation);
-	if (r && !cpumask_test_cpu(cpu, r->siblings))
-		r = NULL;
-	allowed = !r || (r->owner == p && r->cpu == cpu);
-	/* Incumbents must be able to finish an existing migrate-disable region. */
-	if (r && READ_ONCE(r->state) == CORE_RESERVE_DRAINING &&
+
+	reserved_cpu = rcu_dereference(core_reservation);
+
+	if (reserved_cpu && !cpumask_test_cpu(cpu, reserved_cpu->siblings))
+		reserved_cpu = NULL;
+
+	allowed = !reserved_cpu || (reserved_cpu->owner == p && reserved_cpu->cpu == cpu);
+	
+	if (reserved_cpu &&
+	    READ_ONCE(reserved_cpu->state) == CORE_RESERVE_DRAINING &&
 	    is_migration_disabled(p) && task_cpu(p) == cpu)
+	{
 		allowed = true;
+	}
+
 	rcu_read_unlock();
+
 	return allowed;
 }
 
@@ -73,41 +81,57 @@ void sched_core_reserve_affinity_unlock(void)
 	raw_spin_unlock(&core_reserve_lock);
 }
 
-int sched_core_reserve_dest(struct task_struct *p, const struct cpumask *mask,
-			    const struct cpumask *valid)
+// returns the first CPU in mask that is allowed for task p
+// or nr_cpu_ids if none are allowed
+int sched_core_reserve_dest(struct task_struct *p,
+			    const struct cpumask *requested_mask,
+			    const struct cpumask *valid_mask)
 {
 	int cpu;
 
+	// if no SMT core reservation currently exists, 
+	//pick any usable CPU from the intersection of the requested mask and the valid mask
 	if (!rcu_access_pointer(core_reservation))
-		return cpumask_any_and_distribute(valid, mask);
-	for_each_cpu_and(cpu, mask, valid) {
+		return cpumask_any_and_distribute(valid_mask, requested_mask);
+	// otherwise, return first valid option
+	for_each_cpu_and(cpu, requested_mask, valid_mask) {
 		if (sched_core_reserve_allowed(p, cpu))
 			return cpu;
 	}
 	return nr_cpu_ids;
 }
 
+// checks whether a requested CPU-affinity change is compatible with the core reservation
+// p: the task whose CPU affinity is being changed
+// ctx->new_mask : 	the requested set of allowed CPUs
 int sched_core_reserve_affinity_check(struct task_struct *p,
-				    struct affinity_context *ctx)
+				      struct affinity_context *ctx)
 {
 	struct sched_core_reservation *r;
 
 	lockdep_assert_held(&core_reserve_lock);
+	// if there is no reservation, continue with the affinity change
 	if (!rcu_access_pointer(core_reservation))
 		return 0;
+	// allow internal migration-enable/disable operations
 	if (ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE))
 		return 0;
+	// dont't allow a task to be moved off the reserved core
 	if (p->core_reservation && !(ctx->flags & SCA_CORE_RESERVE))
 		return -EBUSY;
 
-	/* affine_move_task() must not enqueue work to a frozen stopper. */
+	// affine_move_task() must not enqueue work to a frozen stopper
 	r = rcu_dereference_protected(core_reservation,
 				      lockdep_is_held(&core_reserve_lock));
 	if (r && cpumask_test_cpu(task_cpu(p), r->siblings) &&
 	    READ_ONCE(r->closing) && !(ctx->flags & SCA_CORE_RESERVE))
 		return -EBUSY;
+
+	// checks if thesre is at least one active CPU in the requested affinity
+	// mask where this task is allowed to run taking in account our core reservation
 	if (!kthread_is_per_cpu(p) &&
-	    sched_core_reserve_dest(p, ctx->new_mask, cpu_active_mask) >= nr_cpu_ids)
+	    sched_core_reserve_dest(p, ctx->new_mask, cpu_active_mask) >=
+		    nr_cpu_ids)
 		return -EBUSY;
 	return 0;
 }
@@ -120,9 +144,11 @@ int sched_core_reserve_fork(struct task_struct *p)
 	/* dup_task_struct copied the pointer; ownership is never inherited. */
 	p->core_reservation = NULL;
 	raw_spin_lock_irqsave(&core_reserve_lock, flags);
-	if (current->core_reservation || (rcu_access_pointer(core_reservation) &&
-	    (!kthread_is_per_cpu(p) &&
-	     sched_core_reserve_dest(p, &p->cpus_mask, cpu_active_mask) >= nr_cpu_ids)))
+	if (current->core_reservation ||
+	    (rcu_access_pointer(core_reservation) &&
+	     (!kthread_is_per_cpu(p) &&
+	      sched_core_reserve_dest(p, &p->cpus_mask, cpu_active_mask) >=
+		      nr_cpu_ids)))
 		ret = -EBUSY;
 	raw_spin_unlock_irqrestore(&core_reserve_lock, flags);
 	return ret;
@@ -274,7 +300,7 @@ static int core_reserve_restore(struct sched_core_reservation *r)
 }
 
 static int core_reserve_evict_task(struct sched_core_reservation *r,
-				 struct task_struct *p)
+				   struct task_struct *p)
 {
 	struct migration_arg arg = { .task = p };
 	struct rq_flags rf;
@@ -422,7 +448,7 @@ unlock:
 	if (ret)
 		goto free;
 
-	ac = (struct affinity_context) {
+	ac = (struct affinity_context){
 		.new_mask = cpumask_of(cpu),
 		.flags = SCA_CORE_RESERVE,
 	};
@@ -457,7 +483,8 @@ unlock:
 	smp_store_release(&r->state, CORE_RESERVE_ACTIVE);
 	core_reserve_resched(r->siblings);
 	while (!cpumask_equal(r->siblings, r->acknowledged)) {
-		if (time_after_eq(jiffies, deadline) || fatal_signal_pending(current)) {
+		if (time_after_eq(jiffies, deadline) ||
+		    fatal_signal_pending(current)) {
 			ret = -EBUSY;
 			goto rollback;
 		}
