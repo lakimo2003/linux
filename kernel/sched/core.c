@@ -9,6 +9,7 @@
  */
 #define INSTANTIATE_EXPORTED_MIGRATE_DISABLE
 #include <linux/sched.h>
+#include <linux/core_reserve.h>
 #include <linux/highmem.h>
 #include <linux/hrtimer_api.h>
 #include <linux/ktime_api.h>
@@ -3121,6 +3122,17 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 	unsigned int dest_cpu;
 	int ret = 0;
 
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
+	// Keep ordinary affinity requests from undoing an active reservation.
+	// Migration completion must remain usable by the scheduler itself.
+	if (!kthread && READ_ONCE(core_reserve_owner) &&
+	    !(ctx->flags & (SCA_CORE_RESERVE | SCA_MIGRATE_ENABLE |
+			    SCA_MIGRATE_DISABLE))) {
+		ret = -EBUSY;
+		goto out;
+	}
+#endif
+
 	if (kthread || is_migration_disabled(p)) {
 		/*
 		 * Kernel threads are allowed on online && !active CPUs,
@@ -3150,7 +3162,9 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 	}
 
 	if (!(ctx->flags & SCA_MIGRATE_ENABLE)) {
-		if (cpumask_equal(&p->cpus_mask, ctx->new_mask)) {
+		// Reservation must also wait for an already pending migration.
+		if (cpumask_equal(&p->cpus_mask, ctx->new_mask) &&
+		    !(ctx->flags & SCA_CORE_RESERVE)) {
 			if (ctx->flags & SCA_USER)
 				swap(p->user_cpus_ptr, ctx->user_mask);
 			goto out;
@@ -3184,6 +3198,49 @@ out:
 
 	return ret;
 }
+
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
+// Save and restrict a task's affinity, or restore its original affinity.
+// The existing scheduler code waits until a running task has migrated.
+int core_reserve_change_affinity(struct task_struct *task,
+				const struct cpumask *available_cpus,
+				bool restore)
+{
+	struct affinity_context affinity = { .flags = SCA_CORE_RESERVE };
+	struct rq_flags runqueue_flags;
+	struct rq *runqueue;
+	int error;
+
+	runqueue = task_rq_lock(task, &runqueue_flags);
+	if (restore) {
+		affinity.new_mask = &task->core_reserve_original_affinity;
+	} else {
+		// Deadline admission needs a different design; reject it here.
+		if (task_has_dl_policy(task)) {
+			task_rq_unlock(runqueue, task, &runqueue_flags);
+			return -EBUSY;
+		}
+		cpumask_copy(&task->core_reserve_original_affinity,
+			     &task->cpus_mask);
+		task->core_reserve_affinity_saved = true;
+		// Preserve old CPU preferences where possible. A task pinned
+		// only to this core must temporarily be allowed elsewhere.
+		if (!cpumask_and(runqueue->scratch_mask, &task->cpus_mask,
+				 available_cpus))
+			cpumask_copy(runqueue->scratch_mask, available_cpus);
+		affinity.new_mask = runqueue->scratch_mask;
+	}
+
+	error = __set_cpus_allowed_ptr_locked(task, &affinity, runqueue,
+					    &runqueue_flags);
+	if (!error && restore) {
+		raw_spin_lock_irq(&task->pi_lock);
+		task->core_reserve_affinity_saved = false;
+		raw_spin_unlock_irq(&task->pi_lock);
+	}
+	return error;
+}
+#endif
 
 /*
  * Change a given task's CPU affinity. Migrate the thread to a
@@ -4804,9 +4861,12 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 {
 	__sched_fork(clone_flags, p);
 
-	#ifdef CONFIG_SMP
-    	p->core_reserve_enabled = false; // The child must not inherit the parent’s “enabled” state
-	#endif
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
+	// User children inherit both the restricted and the saved affinity.
+	// Kernel threads do not participate in user-task isolation.
+	if (p->flags & PF_KTHREAD)
+		p->core_reserve_affinity_saved = false;
+#endif
 	/*
 	 * We mark the process as NEW here. This guarantees that
 	 * nobody will actually run it, and a signal or other external

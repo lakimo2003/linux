@@ -933,11 +933,10 @@ const cpumask_t			*cpus_ptr;
 cpumask_t			*user_cpus_ptr;
 cpumask_t			cpus_mask;
 
-#ifdef CONFIG_SMP
-	bool core_reserve_enabled; //has this thread enabled our mitigation?
-	cpumask_t core_reserve_saved_mask; // what affinity should disable restore?
-	unsigned int core_reserve_cpu; // CPU where the victim runs 
-	cpumask_t core_reserve_siblings; // all logical CPUs of that physical core, including the selected CPU
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
+	// Save each affected thread's affinity until protection is disabled.
+	bool core_reserve_affinity_saved;
+	cpumask_t core_reserve_original_affinity;
 #endif
 
 void				*migration_pending;

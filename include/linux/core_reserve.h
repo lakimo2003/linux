@@ -1,35 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0
 #ifndef _LINUX_CORE_RESERVE_H
 #define _LINUX_CORE_RESERVE_H
 
+#include <linux/errno.h>
 #include <linux/types.h>
 struct task_struct;
-
-enum core_reserve_state {
-	CORE_RESERVE_NONE = 0,
-	CORE_RESERVE_DRAINING,
-};
+struct cpumask;
 
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
+#include <linux/rwsem.h>
 
+extern struct rw_semaphore core_reserve_lock;
+extern struct task_struct *core_reserve_owner;
+
+long core_reserve_enable(unsigned long selected_cpu);
+long core_reserve_disable(void);
 void core_reserve_exit(void);
-bool is_core_claimed_already(unsigned int cpu);
-bool core_reserve_task_allowed(struct task_struct *p,
-                               unsigned int cpu);
-
+int core_reserve_change_affinity(struct task_struct *task,
+				const struct cpumask *available_cpus,
+				bool restore);
 #else
+// Report that this implementation needs an x86 SMP kernel.
+static inline long core_reserve_enable(unsigned long selected_cpu)
+{
+	return -EOPNOTSUPP;
+}
 
+// Report that this implementation needs an x86 SMP kernel.
+static inline long core_reserve_disable(void)
+{
+	return -EOPNOTSUPP;
+}
+
+// There is no reservation to release on unsupported configurations.
 static inline void core_reserve_exit(void) {}
-
-static inline bool is_core_claimed_already(unsigned int cpu)
-{
-    return false;
-}
-
-static inline bool core_reserve_task_allowed(struct task_struct *p,
-                                             unsigned int cpu)
-{
-    return true;
-}
-
 #endif
 #endif

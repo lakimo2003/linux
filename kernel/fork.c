@@ -13,6 +13,7 @@
  */
 
 #include <linux/anon_inodes.h>
+#include <linux/core_reserve.h>
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/mm.h>
@@ -1991,7 +1992,7 @@ static bool need_futex_hash_allocate_default(u64 clone_flags)
  * parts of the process environment (as per the clone
  * flags). The actual kick-off is left to the caller.
  */
-__latent_entropy struct task_struct *copy_process(
+static __latent_entropy struct task_struct *copy_process_unlocked(
 					struct pid *pid,
 					int trace,
 					int node,
@@ -2626,6 +2627,33 @@ fork_out:
 	hlist_del_init(&delayed.node);
 	spin_unlock_irq(&current->sighand->siglock);
 	return ERR_PTR(retval);
+}
+
+// Keep user-task creation outside the enable/disable task walk.
+// Normal children inherit their parent's restricted and saved CPU masks.
+struct task_struct *copy_process(struct pid *pid, int trace, int node,
+				 struct kernel_clone_args *args)
+{
+#if defined(CONFIG_X86) && defined(CONFIG_SMP)
+	struct task_struct *child;
+
+	if (args->kthread)
+		return copy_process_unlocked(pid, trace, node, args);
+
+	down_read(&core_reserve_lock);
+	// A protected thread must disable before creating another user task.
+	// Kernel-created user tasks have no restricted affinity to inherit.
+	if (core_reserve_owner &&
+	    (current == core_reserve_owner || (current->flags & PF_KTHREAD) ||
+	     (args->flags & CLONE_INTO_CGROUP)))
+		child = ERR_PTR(-EBUSY);
+	else
+		child = copy_process_unlocked(pid, trace, node, args);
+	up_read(&core_reserve_lock);
+	return child;
+#else
+	return copy_process_unlocked(pid, trace, node, args);
+#endif
 }
 
 static inline void init_idle_pids(struct task_struct *idle)
