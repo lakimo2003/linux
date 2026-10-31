@@ -44,7 +44,7 @@ static struct task_struct *find_affected_task(bool restore)
 }
 
 // Restore original masks, including masks inherited by children.
-// Keep the reservation active if a restoration unexpectedly fails.
+// Keep unfinished saved masks available if restoration needs another attempt.
 static int restore_user_tasks(void)
 {
 	struct task_struct *task;
@@ -82,6 +82,12 @@ long core_reserve_enable(unsigned long selected_cpu)
 		error = -EBUSY;
 		goto unlock;
 	}
+
+	// Finish any cleanup left behind by an owner that exited.
+	error = restore_user_tasks();
+	if (error)
+		goto unlock;
+
 	if (!cpu_active(selected_cpu)) {
 		error = -EINVAL;
 		goto unlock;
@@ -136,7 +142,15 @@ long core_reserve_disable(void)
 
 	down_write(&core_reserve_lock);
 	cpus_read_lock();
-	error = core_reserve_owner == current ? restore_user_tasks() : -EINVAL;
+
+	// The owner can release protection. An administrator can retry
+	// unfinished cleanup after the owner has exited.
+	if (core_reserve_owner == current ||
+	    (!core_reserve_owner && capable(CAP_SYS_NICE)))
+		error = restore_user_tasks();
+	else
+		error = -EINVAL;
+
 	cpus_read_unlock();
 	up_write(&core_reserve_lock);
 	return error;
@@ -145,7 +159,23 @@ long core_reserve_disable(void)
 // Release protection automatically if its owning thread exits.
 void core_reserve_exit(void)
 {
-	if (READ_ONCE(core_reserve_owner) == current)
-		WARN_ON_ONCE(core_reserve_disable());
+	int error;
+
+	if (READ_ONCE(core_reserve_owner) != current)
+		return;
+
+	down_write(&core_reserve_lock);
+	cpus_read_lock();
+	error = restore_user_tasks();
+
+	// Never leave ownership pointing to a thread that is exiting.
+	// Failed restorations retain their saved masks for a later retry.
+	WRITE_ONCE(core_reserve_owner, NULL);
+	if (error)
+		pr_warn("core_reserve: exit cleanup incomplete (%d); administrator must retry disable\n",
+			error);
+
+	cpus_read_unlock();
+	up_write(&core_reserve_lock);
 }
 #endif
