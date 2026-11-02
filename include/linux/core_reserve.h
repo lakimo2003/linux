@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 #ifndef _LINUX_CORE_RESERVE_H
 #define _LINUX_CORE_RESERVE_H
 
@@ -20,19 +19,18 @@ int core_reserve_change_affinity(struct task_struct *task,
 				const struct cpumask *available_cpus,
 				bool restore);
 #else
-// Report that this implementation needs an x86 SMP kernel.
+//implementation needs an x86 SMP kernel
 static inline long core_reserve_enable(unsigned long selected_cpu)
 {
 	return -EOPNOTSUPP;
 }
 
-// Report that this implementation needs an x86 SMP kernel.
+//implementation needs an x86 SMP kernel
 static inline long core_reserve_disable(void)
 {
 	return -EOPNOTSUPP;
 }
-
-// There is no reservation to release on unsupported configurations.
+//implementation needs an x86 SMP kernel
 static inline void core_reserve_exit(void) {}
 #endif
 #endif

@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-// Minimal experimental isolation of user tasks on one physical core.
-// Keep CPU hotplug, cpusets and scheduling policies unchanged while active.
 #include <linux/core_reserve.h>
 
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
@@ -16,8 +13,7 @@ struct task_struct *core_reserve_owner;
 static cpumask_t reserved_cpus;
 static cpumask_t available_cpus;
 
-// Find one user thread to restrict or restore, and hold a reference to it.
-// Restarting the walk avoids allocating a task array or sleeping under RCU.
+// find one user thread to restrict or restore and hold a reference to it
 static struct task_struct *find_affected_task(bool restore)
 {
 	struct task_struct *process, *task, *found = NULL;
@@ -43,8 +39,7 @@ static struct task_struct *find_affected_task(bool restore)
 	return found;
 }
 
-// Restore original masks, including masks inherited by children.
-// Keep unfinished saved masks available if restoration needs another attempt.
+// restore original masks, including masks inherited by children
 static int restore_user_tasks(void)
 {
 	struct task_struct *task;
@@ -61,14 +56,14 @@ static int restore_user_tasks(void)
 	return 0;
 }
 
-// Pin the caller to the selected CPU and move other user threads off its core.
-// A successful return means all affected threads have finished migrating.
+// Pin the caller to the selected CPU and move other user threads off its core
+// A successful return means all affected threads have finished moving to other cores
 long core_reserve_enable(unsigned long selected_cpu)
 {
 	struct task_struct *task;
 	int error = 0, restore_error;
 
-	// Moving other users' threads requires host administrator privileges.
+	//host administrator privileges required
 	if (sched_proxy_exec())
 		return -EOPNOTSUPP;
 	if (!capable(CAP_SYS_NICE))
@@ -83,7 +78,6 @@ long core_reserve_enable(unsigned long selected_cpu)
 		goto unlock;
 	}
 
-	// Finish any cleanup left behind by an owner that exited.
 	error = restore_user_tasks();
 	if (error)
 		goto unlock;
@@ -105,14 +99,13 @@ long core_reserve_enable(unsigned long selected_cpu)
 		goto unlock;
 	}
 
-	// Publish before changing masks so new affinity requests cannot race us.
+
 	WRITE_ONCE(core_reserve_owner, current);
 	error = core_reserve_change_affinity(current, cpumask_of(selected_cpu), false);
 	if (error)
 		goto restore;
 
 	while ((task = find_affected_task(false))) {
-		// Respect cpuset boundaries even when overriding a user's CPU pin.
 		cpuset_cpus_allowed(task, &available_cpus);
 		cpumask_and(&available_cpus, &available_cpus, cpu_active_mask);
 		cpumask_andnot(&available_cpus, &available_cpus, &reserved_cpus);
@@ -135,7 +128,7 @@ unlock:
 	return error;
 }
 
-// Release the reservation and allow the original CPU masks again.
+// Release the reservation and allow the original CPU masks again
 long core_reserve_disable(void)
 {
 	int error;
@@ -143,8 +136,7 @@ long core_reserve_disable(void)
 	down_write(&core_reserve_lock);
 	cpus_read_lock();
 
-	// The owner can release protection. An administrator can retry
-	// unfinished cleanup after the owner has exited.
+	// owner can release protection
 	if (core_reserve_owner == current ||
 	    (!core_reserve_owner && capable(CAP_SYS_NICE)))
 		error = restore_user_tasks();
@@ -156,7 +148,7 @@ long core_reserve_disable(void)
 	return error;
 }
 
-// Release protection automatically if its owning thread exits.
+// release protection automatically if its owning thread exits.
 void core_reserve_exit(void)
 {
 	int error;
@@ -168,11 +160,10 @@ void core_reserve_exit(void)
 	cpus_read_lock();
 	error = restore_user_tasks();
 
-	// Never leave ownership pointing to a thread that is exiting.
-	// Failed restorations retain their saved masks for a later retry.
+	// dont leave ownership to a thread that is exiting
 	WRITE_ONCE(core_reserve_owner, NULL);
 	if (error)
-		pr_warn("core_reserve: exit cleanup incomplete (%d); administrator must retry disable\n",
+		pr_warn("core_reserve: exit cleanup incomplete (%d)\n",
 			error);
 
 	cpus_read_unlock();

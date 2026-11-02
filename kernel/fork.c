@@ -2629,8 +2629,8 @@ fork_out:
 	return ERR_PTR(retval);
 }
 
-// Keep user-task creation outside the enable/disable task walk.
-// Normal children inherit their parent's restricted and saved CPU masks.
+// keep user-task creation outside the enable/disable 
+// normal children inherit parent's CPU masks
 struct task_struct *copy_process(struct pid *pid, int trace, int node,
 				 struct kernel_clone_args *args)
 {
@@ -2641,8 +2641,7 @@ struct task_struct *copy_process(struct pid *pid, int trace, int node,
 		return copy_process_unlocked(pid, trace, node, args);
 
 	down_read(&core_reserve_lock);
-	// A protected thread must disable before creating another user task.
-	// Kernel-created user tasks have no restricted affinity to inherit.
+	// A protected thread must disable before creating another user task
 	if (core_reserve_owner &&
 	    (current == core_reserve_owner || (current->flags & PF_KTHREAD) ||
 	     (args->flags & CLONE_INTO_CGROUP)))

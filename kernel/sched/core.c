@@ -3123,8 +3123,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 	int ret = 0;
 
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
-	// Keep ordinary affinity requests from undoing an active reservation.
-	// Migration completion must remain usable by the scheduler itself.
+	// keep afinity requests from undoing an active reservation
 	if (!kthread && READ_ONCE(core_reserve_owner) &&
 	    !(ctx->flags & (SCA_CORE_RESERVE | SCA_MIGRATE_ENABLE |
 			    SCA_MIGRATE_DISABLE))) {
@@ -4862,8 +4861,8 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 	__sched_fork(clone_flags, p);
 
 #if defined(CONFIG_X86) && defined(CONFIG_SMP)
-	// User children inherit both the restricted and the saved affinity.
-	// Kernel threads do not participate in user-task isolation.
+	// User children inherit both the restricted and the saved affinity
+	// kernel threads do not participate in isolation
 	if (p->flags & PF_KTHREAD)
 		p->core_reserve_affinity_saved = false;
 #endif
